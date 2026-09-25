@@ -1,0 +1,6 @@
+/motor_node:
+  ros__parameters:
+    gear_ratio: 1.0
+
+    
+

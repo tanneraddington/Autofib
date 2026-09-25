@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="motor_pkg" exec="motor_node" name="motor_node"> 
+        <param from="$(find-pkg-share motor_pkg)/config/config.yaml"/>
+    </node>
+</launch>

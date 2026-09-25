@@ -1,0 +1,4 @@
+aurora_pose_publisher:
+  ros__parameters:
+    poll_rate_hz: 30
+    device_port: "/dev/ttyUSB0"  # Go look in /dev, it may not be 0 on the end

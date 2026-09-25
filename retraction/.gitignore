@@ -1,0 +1,57 @@
+# ROS build and install directories
+build/
+install/
+log/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+
+checkpoints/
+**/checkpoints/
+
+# Large data files
+*.hdf5
+*.pkl
+*.pickle
+
+*.npz
+
+# Logs and results
+logs/
+results/
+*.log
+*.csv
+
+# Environment and IDE
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+dist/
+*.egg-info/

@@ -1,0 +1,10 @@
+.vscode/
+build/
+install/
+log/
+bag_files/
+sendy/sendy/models/diffusion_displacement/weights
+retraction/retraction/models/RetractModels/weights
+surface_tracking_visualizer/surface_tracking_visualizer/model.nrrd
+surface_tracking_visualizer/surface_tracking_visualizer/model.mha
+surface_tracking_visualizer/surface_tracking_visualizer/EMIGSegmentation.mha

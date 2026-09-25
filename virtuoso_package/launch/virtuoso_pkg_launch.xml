@@ -1,0 +1,15 @@
+<launch>
+    <!-- Launch Python Nodes -->
+    <node pkg = "virtuoso_package" exec = "Virtuoso_UI_R.py" output = "screen">
+    </node>
+    <node pkg = "virtuoso_package" exec = "Virtuoso_UI_L.py" output = "screen">
+    </node>
+
+    <!-- Launch C++ Nodes -->
+    <node pkg = "virtuoso_package" exec = "virtuoso_ui_node_r" output = "screen">
+    </node>
+    <node pkg = "virtuoso_package" exec = "virtuoso_ui_node_l" output = "screen">
+    </node>
+    <node pkg = "virtuoso_package" exec = "combine_control" output = "screen">
+    </node>
+</launch>

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+
+from serial import Serial
+import time
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+
+#Establishes serial connection to Virtuoso UI
+
+class UINodeR(Node):
+    def __init__(self):
+        super().__init__('ui_publisher_node_r')
+
+        self.publisher_ = self.create_publisher(Twist,'ui_twist_r',10)
+
+        self.declare_parameter('comment',False)
+        self.comment = self.get_parameter('comment').get_parameter_value().bool_value
+
+        self.serial_port = '/dev/ttyACM0'   #Make sure this matches your USB port for controller
+        self.baud_rate = 115200
+        self.ser = Serial(self.serial_port,self.baud_rate,timeout=1)
+
+        self.timer = self.create_timer(0.0005,self.read_serial_data)    #Publishing rate
+
+        self.get_logger().info('UI Publisher Node Initialized')
+
+    # def read_serial_data(self):
+    #     if self.ser.in_waiting > 0:
+    #         data = self.ser.readline().decode('utf-8').strip()
+    #         if self.comment:
+    #             self.get_logger().info(f'Received: {data}')
+
+    #         try:
+    #             x,y,z,w = map(float,data.split('\t'))
+    #             twist_msg = Twist()
+    #             twist_msg.linear.x = x
+    #             twist_msg.linear.y = y
+    #             twist_msg.linear.z = z
+    #             twist_msg.angular.z = w
+
+    #             #Publish to ROS2 topic
+    #             self.publisher_.publish(twist_msg)
+
+    #         except ValueError as e:
+    #             self.get_logger().error(f'Error parsing data: {e}')
+
+    def read_serial_data(self):
+        if self.ser.in_waiting > 0:
+            try:
+                data = self.ser.readline().decode('utf-8', errors='ignore').strip()
+            except Exception as e:
+                self.get_logger().error(f"Serial read error: {e}")
+                return
+
+            if not data:
+                return  # skip empty lines
+
+            if self.comment:
+                self.get_logger().info(f"Received: {data}")
+
+            try:
+                x, y, z, w = map(float, data.split('\t'))
+                twist_msg = Twist()
+                twist_msg.linear.x = x
+                twist_msg.linear.y = y
+                twist_msg.linear.z = z
+                twist_msg.angular.z = w
+                self.publisher_.publish(twist_msg)
+            except ValueError as e:
+                self.get_logger().warn(f"Parse error: {e} — Raw data: {data}")
+
+    def destroy_node(self):
+        if self.ser.is_open:
+            self.ser.close()
+        super().destroy_node()
+
+def main(args=None):
+        rclpy.init(args=args)
+
+        ui_node = UINodeR()
+
+        rclpy.spin(ui_node)
+
+        ui_node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+                
