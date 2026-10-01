@@ -19,8 +19,8 @@ uterine_move_node.py.
 
 Hardware interface is taken from retract_fib_diffusion_node.py / move_node.py:
   - camera:            /image             (sensor_msgs/Image, shared by both arms)
-  - left start point:  /fwkin_l           (geometry_msgs/Pose)
-  - right start point: /fwkin_r           (geometry_msgs/Pose)
+  - left start point:  smoother_uterus/left/tip in hy/left/fwkin   (TF from smoother_uterus)
+  - right start point: smoother_uterus/right/tip in hy/right/fwkin (TF from smoother_uterus)
   - output: one PointCloud2 topic per task (see ACTION_TOPICS below), each
     carrying the FULL predicted trajectory (N_WAYPOINTS points), consumed by
     uterine_move_node.py (left arm) / uterine_move_node_r.py (right arm).
@@ -49,9 +49,10 @@ from PIL import Image as PILimg
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import Image, PointCloud2
-from geometry_msgs.msg import Pose
 from std_msgs.msg import String
+from tf2_ros import Buffer, TransformListener, TransformException
 from ament_index_python.packages import get_package_share_directory
 
 PACKAGE_PATH = get_package_share_directory('sendy')
@@ -96,10 +97,13 @@ ACTION_TOPICS = {
     "resect":        "/resect_action",
 }
 
-POSE_TOPICS = {
-    "left":  "/fwkin_l",
-    "right": "/fwkin_r",
+# Start points are the smoother's tracked tips (launch smoother_uterus with left_tool_length:=0.0 and
+# right_tool_length:=0.0 so these are the inner-tube ends, the point the models were trained on).
+TIP_FRAMES = {
+    "left":  "smoother_uterus/left/tip",
+    "right": "smoother_uterus/right/tip",
 }
+MAX_TIP_AGE_S = 1.0                 # refuse to plan from an older tip (smoother not running)
 
 CURRENT_TASK_TOPIC = "/current_task"
 CAMERA_TOPIC = "/image"   # shared endoscope view for both arms
@@ -121,7 +125,14 @@ GUIDANCE_SCALE = 0.5
 SAMPLER = "sde"                     # "sde" or "ode"
 
 INTERACTIVE_SELECT = True           # pop up matplotlib trajectory picker
-FRAME_ID = "hy/base"
+
+# Each arm's start point and trajectory are in that arm's model frame. smoother_uterus's launch publishes
+# it as a fixed rotation of smoother_uterus/<side>/base (the axes motor_node's FK uses), so TF and the
+# visual servo can use it.
+FRAME_IDS = {
+    "left":  "hy/left/fwkin",
+    "right": "hy/right/fwkin",
+}
 
 
 # ============================================================================
@@ -334,12 +345,12 @@ class UterineDiffusionNode(Node):
             )
 
         self.latest_image: Optional[np.ndarray] = None
-        self.pose_left: Optional[np.ndarray] = None   # [3] from /fwkin_l
-        self.pose_right: Optional[np.ndarray] = None  # [3] from /fwkin_r
+
+        # Tracked tips from smoother_uterus
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.camera_sub = self.create_subscription(Image, CAMERA_TOPIC, self.camera_callback, 10)
-        self.fwkin_l_sub = self.create_subscription(Pose, POSE_TOPICS["left"], self.fwkin_left_callback, 10)
-        self.fwkin_r_sub = self.create_subscription(Pose, POSE_TOPICS["right"], self.fwkin_right_callback, 10)
         self.task_sub = self.create_subscription(String, CURRENT_TASK_TOPIC, self.task_callback, 10)
 
         self.action_pubs = {
@@ -366,14 +377,6 @@ class UterineDiffusionNode(Node):
             return
         self.latest_image = img
 
-    def fwkin_left_callback(self, msg: Pose):
-        p = msg.position
-        self.pose_left = np.array([p.x, p.y, p.z], dtype=np.float32)
-
-    def fwkin_right_callback(self, msg: Pose):
-        p = msg.position
-        self.pose_right = np.array([p.x, p.y, p.z], dtype=np.float32)
-
     def task_callback(self, msg: String):
         task = msg.data.strip()
         if task not in TASK_NAMES:
@@ -382,7 +385,22 @@ class UterineDiffusionNode(Node):
         self.run_inference_and_publish(task)
 
     def _get_start_point(self, task: str) -> Optional[np.ndarray]:
-        return self.pose_right if ARM_FOR_TASK[task] == "right" else self.pose_left
+        """The arm's tracked tip from smoother_uterus, in that arm's model frame (FRAME_IDS)."""
+        arm = ARM_FOR_TASK[task]
+        try:
+            t = self.tf_buffer.lookup_transform(FRAME_IDS[arm], TIP_FRAMES[arm], Time())
+        except TransformException as e:
+            self.get_logger().error(
+                f"No tracked {arm} tip ({TIP_FRAMES[arm]} in {FRAME_IDS[arm]}): {e}. Is smoother_uterus running?")
+            return None
+
+        age = (self.get_clock().now() - Time.from_msg(t.header.stamp)).nanoseconds / 1e9
+        if age > MAX_TIP_AGE_S:
+            self.get_logger().error(f"Tracked {arm} tip is {age:.1f} s old; is smoother_uterus running?")
+            return None
+
+        p = t.transform.translation
+        return np.array([p.x, p.y, p.z], dtype=np.float32)
 
     # ------------- Inference -------------
 
@@ -397,7 +415,7 @@ class UterineDiffusionNode(Node):
         start_point = self._get_start_point(task)
         arm = ARM_FOR_TASK[task]
         if start_point is None:
-            self.get_logger().error(f"Missing {POSE_TOPICS[arm]} tool pose for '{arm}' arm; cannot run inference.")
+            self.get_logger().error(f"No start point for '{arm}' arm (see above); cannot run inference.")
             return
 
         self.get_logger().info(f"[{task}] Running uterine displacement-diffusion inference ({arm} arm)...")
@@ -421,7 +439,7 @@ class UterineDiffusionNode(Node):
             f"end={selected_traj[-1].round(4)}"
         )
 
-        self.action_pubs[task].publish(xyz_array_to_pointcloud2(selected_traj, frame_id=FRAME_ID))
+        self.action_pubs[task].publish(xyz_array_to_pointcloud2(selected_traj, frame_id=FRAME_IDS[arm]))
         self.get_logger().info(f"[{task}] Published {N_WAYPOINTS}-waypoint trajectory to {ACTION_TOPICS[task]}.")
 
 

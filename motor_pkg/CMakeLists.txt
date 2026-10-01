@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(dynamixel_sdk REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
 include_directories(include)
@@ -17,36 +18,23 @@ include_directories(include)
 
 
 add_executable(motor_node src/motor_node.cpp)
-add_executable(endocam_motor_node src/endocam_motor.cpp)
 target_include_directories(motor_node PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
-  target_include_directories(endocam_motor_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
 
 target_compile_features(motor_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
-target_compile_features(endocam_motor_node PUBLIC c_std_99 cxx_std_17) 
 
 ament_target_dependencies(motor_node
   dynamixel_sdk
   rclcpp
   std_msgs
   geometry_msgs
-)
-
-ament_target_dependencies(endocam_motor_node
-  dynamixel_sdk
-  rclcpp
-  std_msgs
-  geometry_msgs
+  sensor_msgs
 )
 
 
 
 install(TARGETS motor_node
-  DESTINATION lib/${PROJECT_NAME})
-  install(TARGETS endocam_motor_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY

@@ -76,7 +76,7 @@ void printTransform(const geometry_msgs::msg::TransformStamped& transform)
 
 TEST_F(SmootherTfTests, givenInit_broadcastInitialTransforms)
 {
-    GTEST_SKIP() << "The TF requirement for ves_smoother has been obsoleted by aliss_core's launch file";
+    GTEST_SKIP() << "The TF requirement for smoother_uterus has been obsoleted by aliss_core's launch file";
 
     auto node = createNode();
 
@@ -88,12 +88,12 @@ TEST_F(SmootherTfTests, givenInit_broadcastInitialTransforms)
 
     try {
         // expect TF connections:
-        // endoscope_optical ---> ves_smoother/camera (identity transform)
-        // ves_smoother/camera ---> ves_smoother/left/base
-        // ves_smoother/camera ---> ves_smoother/right/base
-        auto transform1 = tf_buffer->lookupTransform("endoscope_optical", "ves_smoother/camera", now);
-        auto transform2 = tf_buffer->lookupTransform("ves_smoother/camera", "ves_smoother/left/base", now);
-        auto transform3 = tf_buffer->lookupTransform("ves_smoother/camera", "ves_smoother/right/base", now);
+        // endoscope_optical ---> smoother_uterus/camera (identity transform)
+        // smoother_uterus/camera ---> smoother_uterus/left/base
+        // smoother_uterus/camera ---> smoother_uterus/right/base
+        auto transform1 = tf_buffer->lookupTransform("endoscope_optical", "smoother_uterus/camera", now);
+        auto transform2 = tf_buffer->lookupTransform("smoother_uterus/camera", "smoother_uterus/left/base", now);
+        auto transform3 = tf_buffer->lookupTransform("smoother_uterus/camera", "smoother_uterus/right/base", now);
 
         printTransform(transform1);
         printTransform(transform2);

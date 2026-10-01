@@ -1,0 +1,11 @@
+Frame 1:
+Left joint value: position=array([3.71526228e+00, 7.31938426e-01, 2.73545434e-02, 3.32526975e-03])
+Right joint value: position=array([3.30079353e+00, 6.18345579e+00, 2.08938735e-02, 1.00000000e-06])
+
+Frame 2:
+Left joint value: position=array([3.43616940e+00, 1.05454368e-01, 2.39505608e-02, 1.16803800e-03])
+Right joint value: position=array([3.13732620e+00, 1.51455879e+00, 2.24374762e-02, 2.25853490e-03])
+
+Frame 3:
+Left joint value: position=array([4.12436203e+00, 2.54912814e+00, 1.88784619e-02, 9.78456078e-04])
+Right joint value: position=array([3.13723033e+00, 6.17667051e+00, 3.52135500e-02, 2.80895747e-03])

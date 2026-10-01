@@ -8,10 +8,10 @@ import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
-DATA_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else "/home/uterine-robot/ros2_ws/checkerboard"
+DATA_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else "/home/cyndaquil/calibration_data2"
 OUT_MP4 = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(DATA_ROOT, os.path.basename(DATA_ROOT) + ".mp4")
 FPS = 15.0
-TOPIC = "/image"
+TOPIC = "/camera/image_rect"
 
 
 def num(p):

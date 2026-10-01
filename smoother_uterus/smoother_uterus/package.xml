@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>smoother_uterus</name>
+  <version>1.0.0</version>
+  <description>Calibration, tracking, and visual servoing for the Virtuoso robot.</description>
+  <maintainer email="jamesmorrisferguson@gmail.com">james</maintainer>
+  <license>Not open source.</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ament_index_cpp</depend>
+  <depend>cv_bridge</depend>
+  <depend>geometry_msgs</depend>
+  <depend>gtsam</depend>
+  <depend>opencv</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>camera_info_manager</test_depend>
+  <test_depend>image_geometry</test_depend>
+  <test_depend>image_transport</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

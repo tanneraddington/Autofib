@@ -1,0 +1,29 @@
+# NOTE: This calibration file was stolen from a test and may not correspond to
+# the images in this folder. It should NOT be used for anything other than testing.
+
+image_width: 1080
+image_height: 1080
+camera_name: ves_camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [728.6819 ,   0.     , 552.1545 ,
+           0.     , 727.97949, 449.86194,
+           0.     ,   0.     ,   1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.340338,  0.093625, -0.002877,  0.005707,  0.0]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [560.41449,   0.     , 723.93917,   0.      ,
+           0.     , 563.37836, 629.48536,   0.      ,
+           0.     ,   0.     ,   1.     ,   0.      ]

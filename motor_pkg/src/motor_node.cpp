@@ -40,6 +40,9 @@
 #include <vector>
 #include <cstdint>
 #include <fstream>
+#include <algorithm>
+#include <array>
+#include <cmath>
 
 #include <dynamixel_sdk/dynamixel_sdk.h>  //Dynamixel library
 
@@ -50,6 +53,8 @@
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float32.hpp>
 using std::placeholders::_1;
 
 
@@ -73,7 +78,7 @@ using std::placeholders::_1;
 #define REV_PER_RADIAN 1/(2*M_PI)
 
 //Define physical parameters for fwkin
-#define CURVATURE_OUTER 100
+#define CURVATURE_OUTER 107
 #define CURVATURE_INNER 0
 #define E 8300
 #define OD_OUTER 0.00145
@@ -110,6 +115,114 @@ dynamixel::GroupSyncWrite * groupSyncWritePosition;//(portHandler, packetHandler
 dynamixel::GroupSyncWrite * groupSyncWriteCurrent;//(portHandler, packetHandler, ADDR_GOAL_POSITION, 4);
 dynamixel::GroupSyncRead * groupSyncRead;
 
+
+//////////////////////////////////////////////////////////////////////////////////////
+// smoother_uterus integration: per-arm joint state feedback
+//
+// Publishes /robot/<side>/joint/measured_jp (sensor_msgs/JointState) for the smoother and
+// the visual_servoing action server. Positions are PHYSICAL joint values (command + keyboard
+// offset), ordered [inner_rotation, outer_rotation, inner_translation, outer_translation],
+// in rad / m, i.e. the same per-arm order as /robot/state/current_state.
+//
+// Params:
+//   joint_readback      (bool,   default false) true: read present positions from the motors
+//                                               false: publish the last command actually sent
+//   joint_state_rate_hz (double, default 30)    republish/read rate so every camera frame has a
+//                                               joint state close in time, even when idle
+//   camera_tracking     (bool,   default true)  false: hold the camera motor at camera_fixed_angle
+//   camera_fixed_angle  (double, default 0.0)   rad, used when camera_tracking is false
+//
+// Kept as file-scope state (like the rest of this file) so motor_node.hpp doesn't need to change.
+//////////////////////////////////////////////////////////////////////////////////////
+namespace {
+  constexpr double TICKS_PER_M   = ENCODER_TICKS_PER_REV / 0.02;          // lead screw: 20 mm / rev
+  constexpr double TICKS_PER_RAD = ENCODER_TICKS_PER_REV / (2.0 * M_PI);
+  //constexpr double CAMERA_MAX_ANGLE = 1.291;                              // rad, same clamp as position_callback
+
+  // motor_array layout: right [0]=ot [1]=or [2]=it [3]=ir, left [4]=ot [5]=or [6]=it [7]=ir
+  // published order per arm:  [ir, or, it, ot]
+  constexpr std::array<int, 4> RIGHT_ARM_IDX = {3, 1, 2, 0};
+  constexpr std::array<int, 4> LEFT_ARM_IDX  = {7, 5, 6, 4};
+
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr js_pub_right;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr js_pub_left;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr js_pub_camera;
+  rclcpp::TimerBase::SharedPtr js_timer;
+
+  std::array<double, 8> joint_phys{};  // physical joint values, motor_array layout
+  double camera_angle_rad = 0.0;
+  bool have_joint_phys = false;
+  bool joint_readback = false;
+  
+  constexpr uint8_t CAMERA_ID = 10;
+  constexpr float CAMERA_HOME_DEG = 15.0f;   // camera angle at the startup (home) position
+  constexpr float CAMERA_MIN_DEG  = 17.0f;
+  constexpr float CAMERA_MAX_DEG  = 88.0f;
+  constexpr float CAMERA_TICKS_PER_DEG = ENCODER_TICKS_PER_REV / 360.0f;
+  bool camera_ready = false;
+  int32_t camera_home_ticks = 0;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr camera_sub;
+
+  void publish_camera_state(const rclcpp::Time & stamp)
+  {
+    sensor_msgs::msg::JointState js;
+    js.header.stamp = stamp;
+    js.name = {"camera"};
+    js.position = {camera_angle_rad};
+    js_pub_camera->publish(js);
+  }
+
+  // CAMERA: call after openPort and after setupDynamixel(BROADCAST_ID), which leaves ID 10 in
+  // mode 5 with torque on. Torque off -> Extended Position (4) -> read home -> torque on.
+  bool setupCamera()
+  {
+    auto logger = rclcpp::get_logger("motor_node");
+
+    if (packetHandler->ping(portHandler, CAMERA_ID, &dxl_error) != COMM_SUCCESS) {
+      RCLCPP_WARN(logger, "Camera motor (ID %d) not detected", CAMERA_ID);
+      return false;
+    }
+    if (packetHandler->write1ByteTxRx(portHandler, CAMERA_ID, ADDR_TORQUE_ENABLE, 0, &dxl_error) != COMM_SUCCESS ||
+        packetHandler->write1ByteTxRx(portHandler, CAMERA_ID, ADDR_OPERATING_MODE, 4, &dxl_error) != COMM_SUCCESS) {
+      RCLCPP_ERROR(logger, "Camera: failed to set Extended Position Control Mode");
+      return false;
+    }
+    uint32_t present = 0;
+    if (packetHandler->read4ByteTxRx(portHandler, CAMERA_ID, ADDR_PRESENT_POSITION, &present, &dxl_error) != COMM_SUCCESS) {
+      RCLCPP_ERROR(logger, "Camera: failed to read home position");
+      return false;
+    }
+    camera_home_ticks = static_cast<int32_t>(present);
+    if (packetHandler->write1ByteTxRx(portHandler, CAMERA_ID, ADDR_TORQUE_ENABLE, 1, &dxl_error) != COMM_SUCCESS) {
+      RCLCPP_ERROR(logger, "Camera: failed to enable torque");
+      return false;
+    }
+    camera_angle_rad = CAMERA_HOME_DEG * M_PI / 180.0;
+    camera_ready = true;
+    RCLCPP_INFO(logger, "Camera motor ready, home position: %d ticks", camera_home_ticks);
+    return true;
+  }
+
+  void publish_joint_states(const rclcpp::Time & stamp, bool publish_camera)
+  {
+    auto make_arm_msg = [&](const std::array<int, 4> & idx) {
+      sensor_msgs::msg::JointState js;
+      js.header.stamp = stamp;
+      js.name = {"inner_rotation", "outer_rotation", "inner_translation", "outer_translation"};
+      for (int k : idx) {
+        js.position.push_back(joint_phys[k]);
+      }
+      return js;
+    };
+    js_pub_right->publish(make_arm_msg(RIGHT_ARM_IDX));
+    js_pub_left->publish(make_arm_msg(LEFT_ARM_IDX));
+
+    if (publish_camera) {
+      publish_camera_state(stamp);
+    }
+  }
+}
+
 //Main node that checks set-up of motors, initializes arrays, and establishes subscribers/publishers
 MotorNode::MotorNode(const rclcpp::NodeOptions & options) : Node("motor_node",options) // Node = superclass, MotorNode = subclass
 {
@@ -135,7 +248,7 @@ MotorNode::MotorNode(const rclcpp::NodeOptions & options) : Node("motor_node",op
   RCLCPP_INFO(this->get_logger(),"True");};
 
   //Check if 9th motor (gripper) is connected
-  dxl_comm_result = packetHandler->ping(portHandler,10,&dxl_error);
+  dxl_comm_result = packetHandler->ping(portHandler,9,&dxl_error);
   if (dxl_comm_result == COMM_SUCCESS) {
     has_gripper = true;
     RCLCPP_INFO(this->get_logger(),"Gripper motor detected");
@@ -145,14 +258,15 @@ MotorNode::MotorNode(const rclcpp::NodeOptions & options) : Node("motor_node",op
   }
 
   //Check if 10th motor (camera actuator) is connected
-  dxl_comm_result = packetHandler->ping(portHandler,9,&dxl_error);
-  if (dxl_comm_result == COMM_SUCCESS) {
-    has_camera = true;
-    RCLCPP_INFO(this->get_logger(),"Camera motor detected");
-  } else {
-    has_camera = false;
-    RCLCPP_WARN(this->get_logger(),"Camera motor not detected");
-  }
+  // dxl_comm_result = packetHandler->ping(portHandler,10,&dxl_error);
+  // if (dxl_comm_result == COMM_SUCCESS) {
+  //   has_camera = true;
+  //   RCLCPP_INFO(this->get_logger(),"Camera motor detected");
+  // } else {
+  //   has_camera = false;
+  //   RCLCPP_WARN(this->get_logger(),"Camera motor not detected");
+  // }
+  has_camera = false;
 
   //Set motor array to appropriate size based on if gripper/camera motors are attached
   if (has_gripper && !has_camera) {
@@ -219,7 +333,7 @@ MotorNode::MotorNode(const rclcpp::NodeOptions & options) : Node("motor_node",op
   // );
 
   //Initialize motor array for 8 motors as float 0s
-  motor_array.data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+  motor_array.data.assign(10, 0.0f);
   fwkin_xyz_l.position.x = 0.0;
   fwkin_xyz_l.position.y = 0.0;
   fwkin_xyz_l.position.z = 0.0;
@@ -240,191 +354,101 @@ MotorNode::MotorNode(const rclcpp::NodeOptions & options) : Node("motor_node",op
   data_store.data = {0.0};
   //motor_array.assign(9,0.0);
 
+//////////////////////////////////////////////////////////////////////////////////////
+  // smoother_uterus integration: joint state publishers (see top of file)
+  //////////////////////////////////////////////////////////////////////////////////////
+  // Params may already exist via automatically_declare_parameters_from_overrides
+  auto param_or = [this](const std::string & name, auto default_value) {
+    if (!this->has_parameter(name)) {
+      this->declare_parameter(name, default_value);
+    }
+    return this->get_parameter(name).get_value<decltype(default_value)>();
+  };
+  joint_readback     = param_or("joint_readback", false);
+  double joint_state_rate_hz = param_or("joint_state_rate_hz", 30.0);
+
+  js_pub_right  = this->create_publisher<sensor_msgs::msg::JointState>("/robot/right/joint/measured_jp", 10);
+  js_pub_left   = this->create_publisher<sensor_msgs::msg::JointState>("/robot/left/joint/measured_jp", 10);
+  js_pub_camera = this->create_publisher<sensor_msgs::msg::JointState>("/robot/camera/joint/measured_jp", 10);
+
+  RCLCPP_INFO(this->get_logger(), "Joint states: %s at %.1f Hz",
+    joint_readback ? "motor read-back" : "last command", joint_state_rate_hz);
+
+   // Default callback group, same as position_callback and js_timer -> serialized bus access.
+  camera_sub = this->create_subscription<std_msgs::msg::Float32>(
+    "/motor_angle", 10,
+    [this](const std_msgs::msg::Float32::SharedPtr msg) {
+      if (!camera_ready) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "Camera motor not ready, ignoring /motor_angle");
+        return;
+      }
+
+      // Safety limits
+      float angle = std::clamp(msg->data, CAMERA_MIN_DEG, CAMERA_MAX_DEG);
+      if (angle != msg->data) {
+        RCLCPP_WARN(this->get_logger(),
+          "Camera angle %.1f outside of range. Moving to %.1f degrees.", msg->data, angle);
+      }
+
+      // Degrees relative to home -> encoder ticks
+      int32_t goal = camera_home_ticks +
+        static_cast<int32_t>((angle - CAMERA_HOME_DEG) * CAMERA_TICKS_PER_DEG);
+
+      if (packetHandler->write4ByteTxRx(portHandler, CAMERA_ID, ADDR_GOAL_POSITION,
+            static_cast<uint32_t>(goal), &dxl_error) != COMM_SUCCESS) {
+        RCLCPP_ERROR(this->get_logger(), "Camera: failed to send position command");
+        return;
+      }
+
+      camera_angle_rad = angle * M_PI / 180.0;
+      publish_camera_state(this->now());
+    });
+
+
+  // Default (mutually exclusive) callback group: never runs concurrently with position_callback
+  // or set_home_callback, so the serial port is never accessed from two threads at once.
+  js_timer = this->create_wall_timer(
+    std::chrono::nanoseconds(static_cast<int64_t>(1e9 / joint_state_rate_hz)),
+    [this]() {
+      if (joint_readback) {
+        // Read present positions of the 8 arm motors and invert the command mapping used in
+        // position_callback:
+        //   rot_ticks   = q_rot * TICKS_PER_RAD * gear + home_rot
+        //   trans_ticks = q_trans * TICKS_PER_M - q_rot * TICKS_PER_RAD * gear + home_trans
+        // The camera angle always comes from the last command (unloaded, so command ~= actual).
+        // At 115200 baud this read costs ~15 ms of bus time; keep the rate modest or raise the baud.
+        groupSyncRead->clearParam();
+        for (uint8_t id = 1; id <= 8; ++id) {
+          groupSyncRead->addParam(id);
+        }
+        if (groupSyncRead->txRxPacket() != COMM_SUCCESS) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Joint read-back: GroupSyncRead failed, not publishing joint states");
+          return;
+        }
+        for (int i = 0; i < 8; i += 2) {  // (translation motor ID i+1, rotation motor ID i+2)
+          if (!groupSyncRead->isAvailable(i + 1, ADDR_PRESENT_POSITION, 4) ||
+              !groupSyncRead->isAvailable(i + 2, ADDR_PRESENT_POSITION, 4)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+              "Joint read-back: missing data for motors %d/%d", i + 1, i + 2);
+            return;
+          }
+          int32_t trans_ticks = static_cast<int32_t>(groupSyncRead->getData(i + 1, ADDR_PRESENT_POSITION, 4));
+          int32_t rot_ticks   = static_cast<int32_t>(groupSyncRead->getData(i + 2, ADDR_PRESENT_POSITION, 4));
+          double rot_rel = static_cast<double>(rot_ticks - motor_home[i + 1]);
+          joint_phys[i + 1] = rot_rel / (TICKS_PER_RAD * gear_ratio);
+          joint_phys[i]     = (static_cast<double>(trans_ticks - motor_home[i]) + rot_rel) / TICKS_PER_M;
+        }
+        have_joint_phys = true;
+      }
+
+      // Command mode: republish the last command with a fresh stamp (joints are static while idle)
+      if (have_joint_phys) {
+        publish_joint_states(this->now(), camera_ready);
+      }
+    });
 }
-
-/////Include if want to write camera position to csv/////
-// void MotorNode::csv_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-//   auto now = std::chrono::system_clock::now();
-//   auto duration = now.time_since_epoch();
-//   double time_in_sec = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-//   std::string time_str = std::to_string(time_in_sec);
-//   std::string data_str = "[";
-//   for (size_t i = 0; i < msg->data.size(); ++i) {
-//     data_str += std::to_string(msg->data[i]);
-//     if (i < msg->data.size()-1) {
-//       data_str += ", ";
-//     }
-//   }
-//   data_str += "]";
-
-//   if (csv_file.is_open()) {
-//     csv_file << time_str << "," << data_str << "\n";
-//   }
-// }
-
-/////Include if want to use discrete sections for camera control/////
-// void MotorNode::state_machine() {
-//   //RCLCPP_INFO(this->get_logger(),"Current state: %d",current_state);
-//   switch(current_state) {
-//     case MOVING:
-//       //RCLCPP_INFO(this->get_logger(),"Motors in MOVING state.");
-//       //rclcpp::spin_some(this->get_node_base_interface());
-//       break;
-//     case CAMERA_ADJUST:
-//       //RCLCPP_INFO(this->get_logger(),"Motors in CAMERA_ADJUST state.");
-//       camera_adjust();
-//       break;
-//     case ERROR:
-//       RCLCPP_ERROR(this->get_logger(),"Motors in ERROR state.");
-//       break;
-//     default:
-//       RCLCPP_ERROR(this->get_logger(),"Unknown state.");
-//       break;
-//   }
-// }
-
-//Include if want to use discrete sections for camera control/////
-//Node to motorize camera to view discrete sections of camera rotating FOV
-//Pressing 1, 2, or 3 will command camera to specified section of rotating FOV. Controllers will then not control the robot until homed again.
-// void MotorNode::camera_adjust() {
-//   //Clear motors
-//   groupSyncWrite->clearParam();
-
-//   //If in moving state instead of tolerance checking state
-//   if (first_camera_loop) {
-//     first_camera_loop = false;    //boolean to determine if camera should be moved or if controllers need to be homed
-
-//     //Code copied from standard motor function
-//     for (int i = 0; i < 10; i++) {
-//         motor_home[i] = first_motor_home[i];
-//         //RCLCPP_INFO(this->get_logger(),"Motor home (initial): %.2f",motor_home[i]);
-//       }
-
-//     //RCLCPP_INFO(this->get_logger(),"Home pos for camera adjust %.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",motor_home[0],motor_home[1],motor_home[2],motor_home[3],motor_home[4],motor_home[5],motor_home[6],motor_home[7]);  
-//     //RCLCPP_INFO(this->get_logger(),"First home pos %.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",first_motor_home[0],first_motor_home[1],first_motor_home[2],first_motor_home[3],first_motor_home[4],first_motor_home[5],first_motor_home[6],first_motor_home[7]);
-
-//     //Sets camera to specified section and tubes to center of new workspace
-//     if (gripper_value == 1.0) {
-//       motor_array.data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-//       RCLCPP_INFO(this->get_logger(),"Set section 1");
-//     } else if (gripper_value == 2.0) {
-//       motor_array.data = {0.0,0.0,-0.006283,-0.006283,0.0,0.0,-0.006283,-0.006283,0.0,camera_s2};
-//       RCLCPP_INFO(this->get_logger(),"Set section 2");
-//     } else if (gripper_value == 3.0) {
-//       motor_array.data = {0.0,0.0,-0.01117,-0.01117,0.0,0.0,-0.01117,-.01117,0.0,camera_s3};
-//       RCLCPP_INFO(this->get_logger(),"Set section 3");
-//     }
-
-//     //Right arm
-//     //add temporary placeholder
-//     std_msgs::msg::Float32MultiArray placeholder_motor_array;
-//     placeholder_motor_array.data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
-//     placeholder_motor_array.data[0] = motor_array.data[3];
-//     placeholder_motor_array.data[1] = motor_array.data[1];
-//     placeholder_motor_array.data[2] = motor_array.data[2];
-//     placeholder_motor_array.data[3] = motor_array.data[0];
-//     //Left arm
-//     placeholder_motor_array.data[4] = motor_array.data[7];
-//     placeholder_motor_array.data[5] = motor_array.data[5];
-//     placeholder_motor_array.data[6] = motor_array.data[6];
-//     placeholder_motor_array.data[7] = motor_array.data[4];
-//     //Gripper & camera
-//     placeholder_motor_array.data[8] = motor_array.data[8];
-//     placeholder_motor_array.data[9] = motor_array.data[9];
-//     motor_array.data = placeholder_motor_array.data;
-
-
-//     for (int i = 0; i < 10; i+=2) {
-//       //Motor position calculation
-//       pos = (int32_t)(motor_array.data[i]*(double)ENCODER_TICKS_PER_REV*(double)LEAD_SCREW_REV_PER_M) + motor_home[i];
-
-//       //RCLCPP_INFO(this->get_logger(),"Motor ID: %d; Position (mm): %.3f",i+1,motor_array.data[i]*1000);
-
-//       //Separate by bytes and words for motors
-//       param_goal_position[0] = DXL_LOBYTE(DXL_LOWORD(pos));
-//       param_goal_position[1] = DXL_HIBYTE(DXL_LOWORD(pos));
-//       param_goal_position[2] = DXL_LOBYTE(DXL_HIWORD(pos));
-//       param_goal_position[3] = DXL_HIBYTE(DXL_HIWORD(pos));
-
-//       size_t param_size_pos = sizeof(param_goal_position)/ sizeof(param_goal_position[0]);
-
-//       //Motor rotation calculation
-//       if (i != 8) {
-//         rot = (int32_t)(motor_array.data[i+1]*(double)ENCODER_TICKS_PER_REV*(double)REV_PER_RADIAN) + motor_home[i+1];
-//        //RCLCPP_INFO(this->get_logger(),"used regular rev/radian");
-//       } else {
-//         rot = (int32_t)(motor_array.data[i+1]*(double)ENCODER_TICKS_PER_REV_CAMERA*(double)REV_PER_RADIAN) + motor_home[i+1];
-//         //RCLCPP_INFO(this->get_logger(),"used camera rev/radian");
-//       };
-      
-//       //Separate by bytes and words for motors
-//       param_goal_rotation[0] = DXL_LOBYTE(DXL_LOWORD(rot));
-//       param_goal_rotation[1] = DXL_HIBYTE(DXL_LOWORD(rot));
-//       param_goal_rotation[2] = DXL_LOBYTE(DXL_HIWORD(rot));
-//       param_goal_rotation[3] = DXL_HIBYTE(DXL_HIWORD(rot));
-
-//       size_t param_size_rot = sizeof(param_goal_rotation)/sizeof(param_goal_rotation[0]);
-
-//       //RCLCPP_INFO(this->get_logger(),"Motor ID: %d; Rotation (deg): %.3f",i+2,motor_array.data[i+1]*(180/M_PI));
-
-//       //Make sure motors were added to groupSyncWrite (able to write encoder positions to motors)
-//       bool add_success1 = groupSyncWrite->addParam(i+1, param_goal_position);
-//       bool add_success2 = groupSyncWrite->addParam(i+2, param_goal_rotation);
-
-//       if (!add_success1) {
-//         RCLCPP_ERROR(this->get_logger(), "Failed to add position cam");
-//       }
-
-//       if (!add_success2) {
-//         RCLCPP_ERROR(this->get_logger(), "Failed to add rotation cam");};
-//     };
-
-//     //Send motors to new position
-//     dxl_comm_result = groupSyncWrite->txPacket();
-//     if (dxl_comm_result == COMM_SUCCESS) {
-//       RCLCPP_INFO(this->get_logger(),"Sent new position to motors!");
-//     } else {
-//       RCLCPP_INFO(this->get_logger(),"Couldn't groupSyncWrite: %s",dxl_comm_result);
-//     }
-
-//   };
-
-//   //After sending motors to new location, controllers must be homed before control is resumed. Check if controller input is homed (.2mm)
-//   check = is_within_tolerance();
-//   if (!check){
-//     //RCLCPP_INFO(this->get_logger(),"Entered while loop");
-//     at_rest = true;
-//     check = is_within_tolerance();
-//   } else if (check) {
-//     //RCLCPP_INFO(this->get_logger(),"Exited while loop");
-//     at_rest = false;
-//     RCLCPP_WARN(this->get_logger(),"UI homed. Returning to MOVING state.");
-//     setHomePos();
-//     //RCLCPP_INFO(this->get_logger(),"Home pos after camera adjust: %.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",motor_home[0],motor_home[1],motor_home[2],motor_home[3],motor_home[4],motor_home[5],motor_home[6],motor_home[7]);
-//     //Update state machine back to moving state
-//     current_state = MOVING;
-//     first_camera_loop = true;
-//   };
-//   //state_machine();
-
-// }
-
-//Include if using camera control with discrete sections
-//Checks if controllers are within tolerance of home position
-// bool MotorNode::is_within_tolerance() {
-//   std::vector<float> target1 = {0.0,0.0,M_PI,0.0,0.0,M_PI,0.0002,0.0};
-//   std::vector<float> target2 = {0.0,0.0,-M_PI,0.0,0.0,-M_PI,0.0002,0.0};
-//   std::vector<float> target3 = {0.0,0.0,0.0,0.0,0.0,0,0.0002,0.0};
-  
-//   std::vector<float> current = last_received_position;
-//   float tol = 0.003;
-//   for (size_t i = 0; i < 8; ++i) {
-//     if (std::abs((current[i] - target1[i]) > tol) && (std::abs(current[i] - target2[i]) > tol) && (std::abs(current[i] - target3[i]) > tol)) {
-//       return false;
-//     };
-//   }
-//   return true;
-// };
 
 //Callback function to control gripper motor. Up arrow opens grasper, down arrow closes grasper. 8mm translation is full open/close
 void MotorNode::gripper_callback(const std_msgs::msg::Float32::SharedPtr msg) {
@@ -467,15 +491,16 @@ void MotorNode::setHomePos() {
   //Clear previously stored home position
   groupSyncRead->clearParam();
 
-  //Set # of loops for homing based on how many motors are connected
-  if (has_gripper && has_camera) {
-    loops = 10;
-    //RCLCPP_INFO(this->get_logger(),"loops: %d",loops);
-  } else if (has_gripper && !has_camera) {
-    loops = 9;
-  } else if (!has_gripper && !has_camera) {
-    loops = 8;
-  }
+  // //Set # of loops for homing based on how many motors are connected
+  // if (has_gripper && has_camera) {
+  //   loops = 10;
+  //   //RCLCPP_INFO(this->get_logger(),"loops: %d",loops);
+  // } else if (has_gripper && !has_camera) {
+  //   loops = 9;
+  // } else if (!has_gripper && !has_camera) {
+  //   loops = 8;
+  // }
+  loops = 8;
 
   for (int i = 0; i < loops; i++) {
     //RCLCPP_INFO(this->get_logger(),"loop: %d",i);
@@ -491,7 +516,7 @@ void MotorNode::setHomePos() {
     RCLCPP_ERROR(this->get_logger(), "Failed to GroupSyncRead");
     //return;
   }
-  RCLCPP_INFO(this->get_logger(),"Motors ready to run!");\
+  RCLCPP_INFO(this->get_logger(),"Motors ready to run!");
   std_msgs::msg::Float32MultiArray home_msg;
   home_msg.data.resize(9);
   for (int i = 0; i < loops; i+=2) {
@@ -588,150 +613,6 @@ void MotorNode::set_home_callback(const std_msgs::msg::Int32::SharedPtr msg) {
   }
 }
 
-// void moveMotors(const std::vector<float>& positions)
-// {
-//   //Clear previous motor positions
-//   groupSyncWrite->clearParam();
-
-//   //If camera & gripper motors are connected, perform automatic tube tracking
-//   if (has_camera) {
-//     loops = 10;
-//     //Set camera motor to be at average of left and right tube translation
-//     motor_array.data[9] = ((positions[2]+positions[6])/2 * scalar * REV_PER_RADIAN * ENCODER_TICKS_PER_REV);
-//     //If command is to pull tubes inside endoscope tip (doesn't happen), set camera position to 0 to avoid breaking camera
-//     if (motor_array.data[9] < 0) {
-//       motor_array.data[9] = 0;
-//     }
-//     else if ((motor_array.data[9] / (REV_PER_RADIAN * ENCODER_TICKS_PER_REV)) > 1.291) {
-//       motor_array.data[9] = 1.291 * REV_PER_RADIAN * ENCODER_TICKS_PER_REV;
-//     }
-
-//   }
-
-//   //Map kinematics output to motor array (Inner Rot, Outer Rot, Inner Trans, Outer Trans -> Outer Trans, Outer Rot, Inner Trans, Inner Rot)
-//   //Right arm
-//   this->motor_array.data[0] = positions[3];
-//   this->motor_array.data[1] = positions[1];
-//   this->motor_array.data[2] = positions[2];
-//   this->motor_array.data[3] = positions[0];
-//   //Left arm
-//   this->motor_array.data[4] = positions[7];
-//   this->motor_array.data[5] = positions[5];
-//   this->motor_array.data[6] = positions[6];
-//   this->motor_array.data[7] = positions[4];
-
-//   //RCLCPP_INFO(this->get_logger(),"Received: %.2f",motor_array.data[1]);
-
-//   //Calculate motor encoder positions from meters or radians and re-format to how motors receive info
-//   for (int i = 0; i<loops; i+=2)
-//   {
-//     //RCLCPP_INFO(this->get_logger(),"i: %d",i);
-//     //Motor position calculation
-//     if (i !=8) {
-//       pos = (int32_t)(motor_array.data[i]*(double)ENCODER_TICKS_PER_REV*(double)LEAD_SCREW_REV_PER_M) + motor_home[i];
-//       if (comments) {
-//         RCLCPP_INFO(this->get_logger(),"Motor ID: %d; Position (mm): %.3f",i+1,motor_array.data[i]*1000);
-//         RCLCPP_INFO(this->get_logger(),"Motor Home: %.2f",motor_home[i]);
-//       //Don't let outer tube retract past motor home position
-//       // if (i==0 | i==4) {
-//       //   if (pos < motor_home[i]) {
-//       //     pos = motor_home[i];
-//       //     RCLCPP_INFO(this->get_logger(),"Don't retract outer tube too far!");
-//       //   }
-//       // }
-//       }
-
-//       //Separate by bytes and words for motors
-//       param_goal_position[0] = DXL_LOBYTE(DXL_LOWORD(pos));
-//       param_goal_position[1] = DXL_HIBYTE(DXL_LOWORD(pos));
-//       param_goal_position[2] = DXL_LOBYTE(DXL_HIWORD(pos));
-//       param_goal_position[3] = DXL_HIBYTE(DXL_HIWORD(pos));
-
-//       size_t param_size_pos = sizeof(param_goal_position)/ sizeof(param_goal_position[0]);
-
-//     };
-
-//     //Motor rotation calculation
-//     if (i != 8) {
-//       rot = (int32_t)(motor_array.data[i+1]*(double)ENCODER_TICKS_PER_REV*(double)REV_PER_RADIAN*gear_ratio) + motor_home[i+1];
-//     } else {
-//       //rot = (int32_t)(motor_array.data[i+1]*(double)ENCODER_TICKS_PER_REV_CAMERA*(double)REV_PER_RADIAN) + motor_home[i+1];
-//       rot = motor_array.data[i+1];
-//       //RCLCPP_INFO(this->get_logger(),"camera: %.2f",rot);
-//     }
-//     if (comments) {
-//         RCLCPP_INFO(this->get_logger(),"Motor ID: %d; Rotation (deg): %.1f",i+2,motor_array.data[i+1]*180/M_PI);
-//         RCLCPP_INFO(this->get_logger(),"Motor Home: %.2f",motor_home[i+1]);
-//       }
-    
-//     //Separate by bytes and words for motors
-//     param_goal_rotation[0] = DXL_LOBYTE(DXL_LOWORD(rot));
-//     param_goal_rotation[1] = DXL_HIBYTE(DXL_LOWORD(rot));
-//     param_goal_rotation[2] = DXL_LOBYTE(DXL_HIWORD(rot));
-//     param_goal_rotation[3] = DXL_HIBYTE(DXL_HIWORD(rot));
-
-//     size_t param_size_rot = sizeof(param_goal_rotation)/sizeof(param_goal_rotation[0]);
-
-//     //Make sure motors were added to groupSyncWrite (able to write encoder positions to motors)
-//     if (i != 8) {
-//       bool add_success1 = groupSyncWrite->addParam(i+1, param_goal_position);
-//       if (!add_success1) {
-//         RCLCPP_ERROR(this->get_logger(), "Failed to add position pos");
-//       }
-//     }
-
-//     bool add_success2 = groupSyncWrite->addParam(i+2, param_goal_rotation);
-
-//     if (!add_success2) {
-//       RCLCPP_ERROR(this->get_logger(), "Failed to add rotation pos");
-//     } else if (add_success2 && i == 8) {
-//     }
-//   }
-
-//   //Move gripper motor to appropriate location (open or closed) - handled separately from 8 motor control 
-//   double gripper = (int32_t)(motor_array.data[8] * (double)ENCODER_TICKS_PER_REV * (double)LEAD_SCREW_REV_PER_M) + motor_home[8];
-//   param_goal_position[0] = DXL_LOBYTE(DXL_LOWORD(gripper));
-//   param_goal_position[1] = DXL_HIBYTE(DXL_LOWORD(gripper));
-//   param_goal_position[2] = DXL_LOBYTE(DXL_HIWORD(gripper));
-//   param_goal_position[3] = DXL_HIBYTE(DXL_HIWORD(gripper));
-  
-//   bool add_success9 = groupSyncWrite->addParam(9,param_goal_position);
-//   if (!add_success9) {
-//     RCLCPP_ERROR(this->get_logger(),"Failed to add motor 9");
-//   }
-//   if (!at_rest) {
-//   dxl_comm_result = groupSyncWrite->txPacket();
-//   if (groupSyncWrite->txPacket() != COMM_SUCCESS)
-//   {
-//     RCLCPP_ERROR(this->get_logger(), "Failed to get position: %s",packetHandler->getTxRxResult(dxl_comm_result));
-//   }
-//   }
-
-//   //Clear motors
-//   groupSyncRead->clearParam();
-//   //If camera motor is connected
-//   if (has_camera) {
-//     while (!groupSyncRead->addParam(10)) {
-//         RCLCPP_ERROR(this->get_logger(), "Failed to add motor ID %d to GroupSyncRead",10);
-//       }
-//     if (groupSyncRead->txRxPacket() != COMM_SUCCESS) {
-//       RCLCPP_ERROR(this->get_logger(), "Failed to GroupSyncRead");
-//     }
-//     if (groupSyncRead->isAvailable(10,ADDR_PRESENT_POSITION,4)) {
-//         //Retrieve current motor position for each motor
-//         camera_pos = groupSyncRead->getData(10,ADDR_PRESENT_POSITION,4);
-//       }
-//     else {
-//       RCLCPP_ERROR(this->get_logger(), "Failed to get position for motor %d",10);
-//     }
-
-//     // RCLCPP_INFO(this->get_logger(),"camera pos: %.2f",camera_pos);
-
-//     data_store.data[0] = camera_pos;
-    
-//     data_publisher->publish(data_store);
-//   }
-// };
 
 //Callback function to control motors. Bulk of work happens here.
 void MotorNode::position_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
@@ -961,16 +842,16 @@ void MotorNode::position_callback(const std_msgs::msg::Float32MultiArray::Shared
   }
   groupSyncWriteCurrent->clearParam();
 
-  //Move gripper motor to appropriate location (open or closed) - handled separately from 8 motor control 
-  double gripper = (int32_t)(motor_array.data[8] * (double)ENCODER_TICKS_PER_REV * (double)LEAD_SCREW_REV_PER_M) + motor_home[8];
-  param_goal_position[0] = DXL_LOBYTE(DXL_LOWORD(gripper));
-  param_goal_position[1] = DXL_HIBYTE(DXL_LOWORD(gripper));
-  param_goal_position[2] = DXL_LOBYTE(DXL_HIWORD(gripper));
-  param_goal_position[3] = DXL_HIBYTE(DXL_HIWORD(gripper));
+  // //Move gripper motor to appropriate location (open or closed) - handled separately from 8 motor control 
+  // double gripper = (int32_t)(motor_array.data[8] * (double)ENCODER_TICKS_PER_REV * (double)LEAD_SCREW_REV_PER_M) + motor_home[8];
+  // param_goal_position[0] = DXL_LOBYTE(DXL_LOWORD(gripper));
+  // param_goal_position[1] = DXL_HIBYTE(DXL_LOWORD(gripper));
+  // param_goal_position[2] = DXL_LOBYTE(DXL_HIWORD(gripper));
+  // param_goal_position[3] = DXL_HIBYTE(DXL_HIWORD(gripper));
   
-  bool add_success9 = groupSyncWritePosition->addParam(9,param_goal_position);
-  if (!add_success9) {
-    RCLCPP_ERROR(this->get_logger(),"Failed to add motor 9");}
+  // bool add_success9 = groupSyncWritePosition->addParam(9,param_goal_position);
+  // if (!add_success9) {
+  //   RCLCPP_ERROR(this->get_logger(),"Failed to add motor 9");}
 
   if (!at_rest) {
   dxl_comm_result = groupSyncWritePosition->txPacket();
@@ -1003,6 +884,17 @@ void MotorNode::position_callback(const std_msgs::msg::Float32MultiArray::Shared
     data_store.data[0] = camera_pos;
     
     data_publisher->publish(data_store);
+  }
+
+  // smoother_uterus integration: in command mode, the physical joints are what was just sent
+  // (post-limit command + keyboard offset). Publish now; the timer republishes while idle.
+  //camera_angle_rad = has_camera ? motor_array.data[9] / TICKS_PER_RAD : 0.0;
+  if (!joint_readback) {
+    for (int i = 0; i < 8; i++) {
+      joint_phys[i] = motor_array.data[i] + offset[i];
+    }
+    have_joint_phys = true;
+    publish_joint_states(this->now(), camera_ready);
   }
   
 };
@@ -1123,6 +1015,9 @@ int main(int argc, char *argv[])
   dxl_comm_result = packetHandler->write4ByteTxRx(portHandler, 8, 112, 200, &dxl_error); // Profile Velocity
   dxl_comm_result = packetHandler->write4ByteTxRx(portHandler, 8, 108, 70, &dxl_error);  // Profile Acceleration
 
+  //Override broadcast setup for motor 10 and record its home
+  setupCamera();
+
   //Set home position as current position when motor node is first initialized
   motornode->setHomePos();
 
@@ -1130,6 +1025,13 @@ int main(int argc, char *argv[])
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(motornode);
   executor.spin();
+
+  // Release file-scope ROS handles before shutdown (avoid static destruction after rclcpp teardown)
+  js_timer.reset();
+  js_pub_right.reset();
+  js_pub_left.reset();
+  js_pub_camera.reset();
+  camera_sub.reset();
 
   rclcpp::shutdown();
   if (motornode->csv_file.is_open()) {
@@ -1143,6 +1045,8 @@ int main(int argc, char *argv[])
       ADDR_TORQUE_ENABLE,
       1,
       &dxl_error);
+
+  packetHandler->write1ByteTxRx(portHandler, CAMERA_ID, ADDR_TORQUE_ENABLE, 0, &dxl_error);
       
 
   return 0;

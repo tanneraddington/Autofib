@@ -13,6 +13,8 @@ Tasks:
     retract_start  left arm  — diffusion approach trajectory (uterine_diffusion_node)
     screw          left arm  — screw / 2mm insert / screw sequence (uterine_move_node), not model-driven
     retract        left arm  — diffusion retraction trajectory (uterine_diffusion_node)
+    calibrate      both arms — start the next arm of the smoother calibration trajectory
+                               (mover_uterus run_calibration, same as /mover_uterus/continue)
 
 Type the same task multiple times to repeat it, e.g.:
     retract_start
@@ -40,6 +42,7 @@ class UterineTaskPublisher(Node):
             "retract_start",
             "screw",
             "retract",
+            "calibrate",
         ]
 
         self.publisher_ = self.create_publisher(String, 'current_task', 10)

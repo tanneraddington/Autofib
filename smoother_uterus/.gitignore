@@ -1,0 +1,21 @@
+# Colcon build directories
+build
+log
+install
+
+# Editor files
+.cache
+.vscode
+
+# Smoother calibration output files
+**/smoother_calibration.yaml
+calibration/*.yaml
+
+# Pybind11 generated files
+external/
+*.egg-info*
+pybind/build
+*__pycache__*
+
+# Any python virtual environments
+*.venv
