@@ -54,9 +54,13 @@ namespace {
     constexpr double INTERARM_DISTANCE         = 0.004; // MEASURE: center-to-center of the two arm channels
     // Sign flipped for camera-below: arms sit on the +y (image-up) side of the camera.
     constexpr double ENDO_BASE_Y_OFFSET        = -0.0025; // MEASURE magnitude (Virtuoso: +0.00324)
-    // Sign flipped for camera-below: camera pitches up toward the tools. Use 0 for a forward-looking camera.
-    constexpr double CAMERA_ANGLE              = 15.0 * M_PI / 180.0; // MEASURE (Virtuoso: +30 deg)
-    constexpr double CAMERA_TO_LENS_Z_OFFSET   = 0.002;
+    // EndoCAMeleon view angle (= /motor_angle). Each image uses its own angle; this nominal value is only
+    // used for images taken before any /motor_angle reading. Positive tilts the view toward the side the
+    // tubes bend to (camera below the tools).
+    constexpr double CAMERA_ANGLE              = 15.0 * M_PI / 180.0;
+    // Optical centre to the view-rotation pivot, along the optical axis. 0: the EndoCAMeleon's view swivels
+    // about the camera, which stays put (was 0.002 on the Virtuoso). Calibrated within CAMERA_TO_LENS_Z_OFFSET_STD.
+    constexpr double CAMERA_TO_LENS_Z_OFFSET   = 0.0;
     constexpr double ENDO_INSERTION            = 0.004;   // MEASURE: how far the lens sits beyond the arm channel exits
     // Yaw of each arm base about its own z axis (the tube bends toward base -y at outer_rot = 0).
     // With the camera below the tools:
@@ -68,7 +72,7 @@ namespace {
     // Geometry-prior uncertainty (used when no calibration is available)
     constexpr double CAMERA_Z_ROTATION_STD     = 20.0 * M_PI / 180.0;
     constexpr double CAMERA_XY_ROTATION_STD    = 5.0  * M_PI / 180.0;
-    constexpr double CAMERA_TO_LENS_Z_OFFSET_STD = 0.01;
+    constexpr double CAMERA_TO_LENS_Z_OFFSET_STD = 0.002;
     constexpr double ENDO_INSERTION_STD        = 0.003;
     constexpr double ARM_BASE_INSERTION_STD    = 0.0005;
     constexpr double ARM_BASE_ROTATION_STD     = 5.0  * M_PI / 180.0;
@@ -84,15 +88,16 @@ namespace {
     constexpr double OUTER_X_CURVATURE_PRIOR_STD  = 15.0;
     constexpr double INNER_CURVATURE_PRIOR_STD  = 5.0;
 
-    // Lens pose relative to camera (world): translate in z by camera offset, no rotation
-    static const Pose3 LENS_POSE_NOMINAL = Pose3(
+    // World frame = endoscope tip frame (TF: smoother_uterus/endo): fixed to the scope, origin at the view
+    // pivot, z along the shaft. The arm bases are constant in it at every view angle. For each image:
+    //   camera_from_endo(angle) = CAMERA_MOUNT * view_pose(angle)
+    // CAMERA_MOUNT (lens/pivot frame in the camera optical frame) is a calibrated variable; view_pose is the
+    // known rotation for that image's view angle. This is the same chain the fixed-camera model used, with
+    // the angle supplied per image instead of a constant.
+    static const Pose3 CAMERA_MOUNT_NOMINAL = Pose3(
         Rot3::Identity(), Point3(0, 0, CAMERA_TO_LENS_Z_OFFSET));
 
-    // Endoscope tip pose relative to lens: rotate by camera angle, no translation
-    static const Pose3 LENS_TO_ENDO_TIP_NOMINAL = Pose3(
-        Rot3::Rz(M_PI) * Rot3::Rx(-CAMERA_ANGLE), Point3::Zero());
-
-    // Endoscope tip pose relative to endoscope base: rotate to point y axis down, translate to endoscope tip
+    // Endoscope tip pose relative to endoscope base: translate to endoscope tip
     static const Pose3 ENDO_TIP_TO_ENDO_BASE_NOMINAL = Pose3(
         Rot3::Identity(), Point3(0, 0, ENDO_INSERTION));
 
@@ -103,10 +108,16 @@ namespace {
     static const Pose3 RIGHT_BASE_TO_ENDO_BASE_NOMINAL = Pose3(
         Rot3::Rz(ARM_BASE_YAW), Point3(-INTERARM_DISTANCE / 2, -ENDO_BASE_Y_OFFSET, 0));
 
-    static const Pose3 ENDO_TIP_POSE_NOMINAL  = LENS_POSE_NOMINAL * LENS_TO_ENDO_TIP_NOMINAL.inverse();
-    static const Pose3 ENDO_BASE_POSE_NOMINAL = ENDO_TIP_POSE_NOMINAL * ENDO_TIP_TO_ENDO_BASE_NOMINAL.inverse();
+    // Nominal poses in the endoscope tip frame
+    static const Pose3 ENDO_BASE_POSE_NOMINAL  = ENDO_TIP_TO_ENDO_BASE_NOMINAL.inverse();
     static const Pose3 LEFT_BASE_POSE_NOMINAL  = ENDO_BASE_POSE_NOMINAL * LEFT_BASE_TO_ENDO_BASE_NOMINAL;
     static const Pose3 RIGHT_BASE_POSE_NOMINAL = ENDO_BASE_POSE_NOMINAL * RIGHT_BASE_TO_ENDO_BASE_NOMINAL;
+
+    // Endoscope tip pose in the lens/pivot frame for a given view angle (rotation only)
+    Pose3 view_pose(double camera_angle)
+    {
+        return Pose3(Rot3::Rz(M_PI) * Rot3::Rx(-camera_angle), Point3::Zero()).inverse();
+    }
 
     static const Vector2 OUTER_CURVATURE_NOMINAL = Vector2(OUTER_X_CURVATURE_NOMINAL, 0);
     static const Vector2 INNER_CURVATURE_NOMINAL = Vector2::Zero();
@@ -115,6 +126,7 @@ namespace {
     constexpr double CALIB_MAX_OUTER_CURVATURE_DIFF = 3.0 * OUTER_X_CURVATURE_PRIOR_STD;
     constexpr double CALIB_MAX_INNER_CURVATURE_DIFF = 3.0 * INNER_CURVATURE_PRIOR_STD;
     constexpr double CALIB_MAX_BASE_ROTATION_RAD    = 45.0 * M_PI / 180.0;
+    constexpr double CALIB_MAX_CAMERA_ROTATION_RAD  = 45.0 * M_PI / 180.0;
 
     // GTSAM factor graph key helpers
 
@@ -162,17 +174,12 @@ Key tip_force_key(ArmSide side, int time_idx)
     return Symbol('F', 1000 * time_idx + side_idx);
 }
 
-Key endo_tip_pose_key()
-{
-    return Symbol('E', 42);
-}
-
 Key endo_base_pose_key()
 {
     return Symbol('E', 43);
 }
 
-Key lens_pose_key()
+Key camera_mount_key()
 {
     return Symbol('E', 44);
 }
@@ -185,13 +192,15 @@ SingleArmSample::SingleArmSample(
     const gtsam::Vector4& joint_values,
     const std::vector<gtsam::Vector2>& keypoints,
     const Vector3Gaussian& tip_force,
-    const std::optional<Vector3Gaussian>& tip_position_meas)
+    const std::optional<Vector3Gaussian>& tip_position_meas,
+    std::optional<double> camera_angle)
 :
     time_seconds(time_seconds),
     joint_values(joint_values),
     keypoints(keypoints),
     tip_force(tip_force),
-    tip_position_meas(tip_position_meas)
+    tip_position_meas(tip_position_meas),
+    camera_angle(camera_angle)
 {}
 
 SmootherSolver::SmootherSolver(const gtsam::Cal3_S2& camera_intrinsics)
@@ -222,16 +231,14 @@ void SmootherSolver::init_noise_models()
 
     set_pixel_meas_std(PIXEL_MEAS_STD);
 
-    lens_pose_noise_model_ = noiseModel::Diagonal::Sigmas((Vector6() <<
-        SMALL_ROTATION_STD, SMALL_ROTATION_STD, SMALL_ROTATION_STD,
+    // Camera mount: tilt (x, y) and roll about the optical axis (z), plus the pivot offset along it.
+    // These are the uncertainties the fixed-camera chain put on the lens and lens-to-endoscope poses.
+    camera_mount_noise_model_ = noiseModel::Diagonal::Sigmas((Vector6() <<
+        CAMERA_XY_ROTATION_STD, CAMERA_XY_ROTATION_STD, CAMERA_Z_ROTATION_STD,
         SMALL_POSITION_STD, SMALL_POSITION_STD,
         CAMERA_TO_LENS_Z_OFFSET_STD).finished());
 
-    lens_to_endo_tip_noise_model_ = noiseModel::Diagonal::Sigmas((Vector6() <<
-        CAMERA_XY_ROTATION_STD, CAMERA_XY_ROTATION_STD, CAMERA_Z_ROTATION_STD,
-        SMALL_POSITION_STD, SMALL_POSITION_STD, SMALL_POSITION_STD).finished());
-
-    endo_tip_to_endo_base_noise_model_ = noiseModel::Diagonal::Sigmas((Vector6() <<
+    endo_base_noise_model_ = noiseModel::Diagonal::Sigmas((Vector6() <<
         SMALL_ROTATION_STD, SMALL_ROTATION_STD, SMALL_ROTATION_STD,
         SMALL_POSITION_STD, SMALL_POSITION_STD,
         ENDO_INSERTION_STD).finished());
@@ -354,37 +361,47 @@ void SmootherSolver::init_values()
         try_insert(values_, base_pose_key(side), 
             (side == ArmSide::LEFT) ? LEFT_BASE_POSE_NOMINAL : RIGHT_BASE_POSE_NOMINAL);
     }
+
+    // The camera mount is in the graph in both modes (geometry prior or calibration)
+    try_insert(values_, camera_mount_key(), CAMERA_MOUNT_NOMINAL);
+}
+
+Pose3 SmootherSolver::calibrated_camera_mount() const
+{
+    return (calibration_ && calibration_->camera_mount) ? Pose3(calibration_->camera_mount->mean) : CAMERA_MOUNT_NOMINAL;
 }
 
 void SmootherSolver::add_calibration_factors()
 {
-    // We have to remove these keys if they already exist in the graph, since they won't be optimized in this case.
-    // GTSAM will throw an exception for keys that are in Values but not in graph
-    if (values_.exists(lens_pose_key()))
-        values_.erase(lens_pose_key());
-
+    // The endoscope base only exists in geometry-prior mode. Remove it if a previous solve left it behind,
+    // since GTSAM throws for keys that are in Values but not in the graph.
     if (values_.exists(endo_base_pose_key()))
         values_.erase(endo_base_pose_key());
-
-    if (values_.exists(endo_tip_pose_key()))
-        values_.erase(endo_tip_pose_key());
 
     // Ensure we always access the state copy, never the member.
     const auto& c = calibration_.value();
     const auto& l = c.left_arm;
     const auto& r = c.right_arm;
 
-    // Left base pose prior
+    // Once calibrated, the geometry is rigid: the camera mount and the arm bases are held at their calibrated
+    // values, so the camera only moves when the view angle changes (a rotation about the scope's x axis) and
+    // the base frames never move. Keypoints are then fitted by bending the tubes. Letting the tracker re-fit
+    // the mount and bases within the calibration covariance made the camera and base frames drift with every
+    // tube motion, especially after a one-angle calibration, which leaves the mount loosely determined.
+    graph_.add(PriorFactor<Pose3>(
+        camera_mount_key(),
+        calibrated_camera_mount(),
+        small_pose_noise_model_));
+
     graph_.add(PriorFactor<Pose3>(
         base_pose_key(ArmSide::LEFT),
         Pose3(l.base_pose.mean),
-        l.base_pose.cov));
+        small_pose_noise_model_));
 
-    // Right base pose prior
     graph_.add(PriorFactor<Pose3>(
         base_pose_key(ArmSide::RIGHT),
         Pose3(r.base_pose.mean),
-        r.base_pose.cov));
+        small_pose_noise_model_));
 
     // Left outer tube curvature prior
     graph_.add(PriorFactor<Vector2>(
@@ -520,15 +537,18 @@ void SmootherSolver::add_single_sample_factors(ArmSide side, int time_idx, bool 
     // trained on the bare tube tip, and tip_offset accounts for whatever tool is mounted there.
     // 
     // Note: skipped in stage 1 of a 2 stage solve so geometry initialises before keypoints pull on it
+    // The camera pose for this image comes from the shared camera mount and this image's view angle.
     if (include_keypoints && !sample.keypoints.empty()) {
         graph_.add(TipProjectionFactor(
+            camera_mount_key(),
             tube_pose_key(side, ArmTube::INNER, NODES_PER_TUBE - 1, time_idx),
             sample.keypoints,
             camera_intrinsics_,
+            view_pose(sample.camera_angle.value_or(CAMERA_ANGLE)),
             pixel_noise_model_));
     }
 
-    // Optional absolute tip position constraint (e.g., from an external tracking system)
+    // Optional absolute tip position constraint (e.g., from an external tracking system), in the endoscope frame
     if (sample.tip_position_meas) {
         auto noise = noiseModel::Gaussian::Covariance(sample.tip_position_meas->cov);
 
@@ -542,30 +562,20 @@ void SmootherSolver::add_single_sample_factors(ArmSide side, int time_idx, bool 
 
 void SmootherSolver::add_geometry_prior_factors()
 {
-    // Endo/lens keys are only in the graph in geometry-prior mode; insert defaults preserving warm starts.
-    try_insert(values_, lens_pose_key(), LENS_POSE_NOMINAL);
+    // The endoscope base key is only in the graph in geometry-prior mode; insert a default preserving warm starts.
     try_insert(values_, endo_base_pose_key(), ENDO_BASE_POSE_NOMINAL);
-    try_insert(values_, endo_tip_pose_key(), ENDO_TIP_POSE_NOMINAL);
 
-    // Lens pose relative to camera
+    // Camera mount (tilt, roll and pivot offset of the camera relative to the scope)
     graph_.add(PriorFactor<Pose3>(
-        lens_pose_key(),
-        LENS_POSE_NOMINAL,
-        lens_pose_noise_model_));
-    
-    // Lens pose relative to endoscope tip
-    graph_.add(BetweenFactor<Pose3>(
-        endo_tip_pose_key(),
-        lens_pose_key(),
-        LENS_TO_ENDO_TIP_NOMINAL,
-        lens_to_endo_tip_noise_model_));
-    
-    // Endoscope tip pose relative to endoscope base
-    graph_.add(BetweenFactor<Pose3>(
+        camera_mount_key(),
+        CAMERA_MOUNT_NOMINAL,
+        camera_mount_noise_model_));
+
+    // Endoscope base in the endoscope tip frame (the world origin): insertion uncertainty
+    graph_.add(PriorFactor<Pose3>(
         endo_base_pose_key(),
-        endo_tip_pose_key(),
-        ENDO_TIP_TO_ENDO_BASE_NOMINAL,
-        endo_tip_to_endo_base_noise_model_));
+        ENDO_BASE_POSE_NOMINAL,
+        endo_base_noise_model_));
     
     // Left and Right base poses relative to endoscope base
     graph_.add(BetweenFactor<Pose3>(
@@ -710,14 +720,17 @@ void extract_jac_position_joints(
     solution.jac_tip_pose.bottomRows<3>() = Jv;
 }
 
+// tip_pose is in the endoscope frame. Its covariance is in body coordinates, which a fixed change of the
+// reference frame (camera_from_endo) leaves unchanged.
 void compute_joint_uvz(
     const Pose3Gaussian& tip_pose,
+    const Pose3& camera_from_endo,
     const Cal3_S2& camera_intrinsics,
     Vector3Gaussian& uvz)
 {
     Matrix36 d_uvz_d_tip_pose;
     bool behind_camera = project_pose_to_uvz(
-        Pose3(tip_pose.mean),
+        camera_from_endo * Pose3(tip_pose.mean),
         camera_intrinsics,
         uvz.mean,
         d_uvz_d_tip_pose);
@@ -753,6 +766,13 @@ void SmootherSolver::extract_single_arm(
     const auto& v = values_;
     const auto& m = marginals_;
 
+    // This image's camera: the mount (exactly the calibrated one once calibrated, else as estimated) and this
+    // sample's view angle
+    const auto& sample = samples_for(side)[time_idx];
+    const Pose3 mount = calibration_ ? calibrated_camera_mount() : v.at<Pose3>(camera_mount_key());
+    const Pose3 camera_from_endo = mount * view_pose(sample.camera_angle.value_or(CAMERA_ANGLE));
+    solution.camera_from_endo = camera_from_endo.matrix();
+
     // Extract all tube pose marginals
     for (auto tube : {ArmTube::OUTER, ArmTube::INNER}) {
         auto& tube_poses = (tube == ArmTube::OUTER)
@@ -766,7 +786,7 @@ void SmootherSolver::extract_single_arm(
         for (int i = 0; i < NODES_PER_TUBE; ++i) {
             auto key = tube_pose_key(side, tube, i, time_idx);
             tube_poses[i] = extract_pose_gaussian(key, v, m);
-            compute_joint_uvz(tube_poses[i], camera_intrinsics_, tube_uvz[i]);
+            compute_joint_uvz(tube_poses[i], camera_from_endo, camera_intrinsics_, tube_uvz[i]);
         }
     }
 
@@ -775,9 +795,9 @@ void SmootherSolver::extract_single_arm(
     solution.tip_force = extract_vector3_gaussian(tip_force_key(side, time_idx), v, m);
 
     // Tip pixel prediction
-    compute_joint_uvz(solution.tip_pose, camera_intrinsics_, solution.tip_uvz);
+    compute_joint_uvz(solution.tip_pose, camera_from_endo, camera_intrinsics_, solution.tip_uvz);
 
-    // Note curvature is approximate, does not include effects of clearance angles
+    // Note curvature is approximate, does not include effects of clearance angles. Jacobian is in the endoscope frame.
     double x_curvature = v.at<Vector2>(curvature_key(side, ArmTube::OUTER))[0];
     Pose3 base_pose = v.at<Pose3>(base_pose_key(side));
     extract_jac_position_joints(solution, base_pose, x_curvature);
@@ -797,6 +817,15 @@ static void check_single_arm_calibration(SingleArmCalibration& calib, const Pose
 
 void SmootherSolver::extract_calibration(SmootherSolution& solution)
 {
+    // The tracker holds the calibration fixed, so it reports exactly the calibration it was given: that's what
+    // gets published as the base frames and saved at the end of a calibration run.
+    if (calibration_) {
+        const double total_time_ms = solution.calibration.total_time_ms;
+        solution.calibration = *calibration_;
+        solution.calibration.total_time_ms = total_time_ms;
+        return;
+    }
+
     const auto& v = values_;
     const auto& m = marginals_;
     auto& l = solution.calibration.left_arm;
@@ -808,20 +837,20 @@ void SmootherSolver::extract_calibration(SmootherSolution& solution)
     l.inner_curvature = extract_vector2_gaussian(curvature_key(ArmSide::LEFT,  ArmTube::INNER), v, m);
     r.outer_curvature = extract_vector2_gaussian(curvature_key(ArmSide::RIGHT, ArmTube::OUTER), v, m);
     r.inner_curvature = extract_vector2_gaussian(curvature_key(ArmSide::RIGHT, ArmTube::INNER), v, m);
+    solution.calibration.camera_mount = extract_pose_gaussian(camera_mount_key(), v, m);
+    solution.calibration.camera_mount_diff =
+        Pose3::Logmap(CAMERA_MOUNT_NOMINAL.between(Pose3(solution.calibration.camera_mount->mean)));
 
-    // Meta: calibrator (no calibration_ set) counts its own accumulated samples;
-    // tracker (calibration_ set) preserves the count from the calibrator so the saved
-    // file reflects how many samples went into the calibration, not the tracker window.
-    l.num_samples = calibration_ ? calibration_->left_arm.num_samples  : samples_for(ArmSide::LEFT).size();
-    r.num_samples = calibration_ ? calibration_->right_arm.num_samples : samples_for(ArmSide::RIGHT).size();
+    // How many samples went into this calibration (kept when the tracker passes it through and it's saved)
+    l.num_samples = samples_for(ArmSide::LEFT).size();
+    r.num_samples = samples_for(ArmSide::RIGHT).size();
     solution.calibration.total_time_ms = solution.total_time_ms;
 
-    // Tracker solves have fixed calibration priors and never use is_valid.
-    if (!calibration_) {
-        check_single_arm_calibration(solution.calibration.left_arm,  LEFT_BASE_POSE_NOMINAL);
-        check_single_arm_calibration(solution.calibration.right_arm, RIGHT_BASE_POSE_NOMINAL);
-        solution.calibration.is_valid = l.is_valid && r.is_valid;
-    }
+    check_single_arm_calibration(solution.calibration.left_arm,  LEFT_BASE_POSE_NOMINAL);
+    check_single_arm_calibration(solution.calibration.right_arm, RIGHT_BASE_POSE_NOMINAL);
+    const bool camera_valid =
+        solution.calibration.camera_mount_diff.head<3>().norm() < CALIB_MAX_CAMERA_ROTATION_RAD;
+    solution.calibration.is_valid = l.is_valid && r.is_valid && camera_valid;
 }
 
 void SmootherSolver::extract_solution(SmootherSolution& solution)

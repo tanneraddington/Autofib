@@ -25,6 +25,7 @@ namespace {
     constexpr bool   DEFAULT_IGNORE_KEYPOINTS_MODE = false;
     constexpr bool   DEFAULT_TRACK_FORCES_MODE     = false;
     constexpr double DEFAULT_CAMERA_LAG_SECONDS    = 0.07;   // lag between image timestamps and actual capture time
+    constexpr double DEFAULT_CAMERA_SETTLE_SECONDS = 1.0;    // after a view-angle change, ignore keypoints this long
     constexpr double DEFAULT_LEFT_TIP_OFFSET_Z     = 0.004;  // spatula pusher
     constexpr double DEFAULT_RIGHT_TIP_OFFSET_Z    = 0.008;  // cautery probe
 
@@ -33,12 +34,13 @@ namespace {
     // Images must be RECTIFIED, with a matching CameraInfo (the robot's raw feed is /image).
     constexpr const char* DEFAULT_LEFT_JOINT_STATE_TOPIC   = "/robot/left/joint/measured_jp";
     constexpr const char* DEFAULT_RIGHT_JOINT_STATE_TOPIC  = "/robot/right/joint/measured_jp";
-    constexpr const char* DEFAULT_CAMERA_JOINT_STATE_TOPIC = "/robot/camera/joint/measured_jp";
+    constexpr const char* DEFAULT_CAMERA_ANGLE_TOPIC       = "/motor_angle";  // std_msgs/Float32, degrees (= CAMERA_ANGLE)
     constexpr const char* DEFAULT_IMAGE_TOPIC              = "/camera/image_rect";
     constexpr const char* DEFAULT_CAMERA_INFO_TOPIC        = "/camera/camera_info";
 
-    // Camera motor motion beyond this (from the first reading) invalidates the fixed-camera model
-    constexpr double CAMERA_MOTION_WARN_RAD = 1.0 * M_PI / 180.0;
+    // View-angle readings closer than this to the last one are not a change
+    constexpr double CAMERA_ANGLE_CHANGE_EPS_RAD = 0.01 * M_PI / 180.0;
+    constexpr size_t CAMERA_ANGLE_HISTORY_SIZE   = 100;
 
     // Constants (could be ROS params later if we want to be fancy)
     constexpr double SMALL_FORCE_STD = 1e-2; // Near-zero force prior when not estimating forces; squared gives 1e-4 variance (matching the old 0.0001 * I covariance)
@@ -63,13 +65,13 @@ SmootherNode::SmootherNode() : Node{"smoother_uterus"}
     // Topic names (static, read once at startup)
     const auto left_joint_state_topic   = this->declare_parameter<std::string>("left_joint_state_topic",   DEFAULT_LEFT_JOINT_STATE_TOPIC);
     const auto right_joint_state_topic  = this->declare_parameter<std::string>("right_joint_state_topic",  DEFAULT_RIGHT_JOINT_STATE_TOPIC);
-    const auto camera_joint_state_topic = this->declare_parameter<std::string>("camera_joint_state_topic", DEFAULT_CAMERA_JOINT_STATE_TOPIC);
+    camera_angle_topic_                 = this->declare_parameter<std::string>("camera_angle_topic",       DEFAULT_CAMERA_ANGLE_TOPIC);
     const auto image_topic              = this->declare_parameter<std::string>("image_topic",              DEFAULT_IMAGE_TOPIC);
     const auto camera_info_topic        = this->declare_parameter<std::string>("camera_info_topic",        DEFAULT_CAMERA_INFO_TOPIC);
 
-    RCLCPP_INFO(this->get_logger(), "Joint states: %s, %s | image: %s | camera_info: %s | camera joint: %s",
+    RCLCPP_INFO(this->get_logger(), "Joint states: %s, %s | image: %s | camera_info: %s | view angle: %s",
         left_joint_state_topic.c_str(), right_joint_state_topic.c_str(),
-        image_topic.c_str(), camera_info_topic.c_str(), camera_joint_state_topic.c_str());
+        image_topic.c_str(), camera_info_topic.c_str(), camera_angle_topic_.c_str());
 
     // Subscribe to left and right joint states
     left_joint_state_sub_ = this->create_subscription<JointState>(
@@ -80,10 +82,10 @@ SmootherNode::SmootherNode() : Node{"smoother_uterus"}
         right_joint_state_topic, 10,
         std::bind(&SmootherNode::right_joint_state_callback, this, std::placeholders::_1));
 
-    // Camera motor angle, only used to check that the camera stays put
-    camera_joint_state_sub_ = this->create_subscription<JointState>(
-        camera_joint_state_topic, 10,
-        std::bind(&SmootherNode::camera_joint_state_callback, this, std::placeholders::_1));
+    // EndoCAMeleon view angle (degrees), used for every image's camera pose
+    camera_angle_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+        camera_angle_topic_, 10,
+        std::bind(&SmootherNode::camera_angle_callback, this, std::placeholders::_1));
 
     // Subscribe to camera info and image
     camera_info_sub_ = this->create_subscription<CameraInfo>(
@@ -165,6 +167,7 @@ void SmootherNode::camera_info_callback(const CameraInfo::SharedPtr camera_info_
         camera_intrinsics.fx(), camera_intrinsics.fy(), camera_intrinsics.px(), camera_intrinsics.py());
 
     // Now that we finally have the camera intrinsics, we can initialize the estimation pipeline
+    publisher_->set_camera_intrinsics(camera_intrinsics);
     init_pipeline(camera_intrinsics);
     RCLCPP_INFO(this->get_logger(), "Pipeline initialized and ready to process raw data samples.");
 
@@ -192,24 +195,40 @@ void SmootherNode::right_joint_state_callback(const JointState::ConstSharedPtr& 
     push_joint_state_bounded(right_joint_state_history_, msg, joint_state_history_size_);
 }
 
-void SmootherNode::camera_joint_state_callback(const JointState::ConstSharedPtr& msg)
+void SmootherNode::camera_angle_callback(const std_msgs::msg::Float32::ConstSharedPtr& msg)
 {
-    if (msg->position.empty())
+    const double angle_rad = static_cast<double>(msg->data) * M_PI / 180.0;
+    if (!std::isfinite(angle_rad))
         return;
 
-    const double angle = msg->position[0];
-    if (!reference_camera_angle_) {
-        reference_camera_angle_ = angle;
-        RCLCPP_INFO(this->get_logger(), "Camera motor angle: %.3f rad (must stay fixed while tracking)", angle);
+    // Only store changes, so a topic republished at a fixed rate doesn't look like constant motion
+    if (!camera_angle_history_.empty() &&
+        std::abs(angle_rad - camera_angle_history_.back().angle_rad) < CAMERA_ANGLE_CHANGE_EPS_RAD)
         return;
-    }
 
-    if (std::abs(angle - *reference_camera_angle_) > CAMERA_MOTION_WARN_RAD) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Camera motor moved %.1f deg from its starting angle. The smoother assumes a fixed camera, so "
-            "calibration and tracking are invalid while it moves (run motor_node with camera_tracking:=false).",
-            (angle - *reference_camera_angle_) * 180.0 / M_PI);
-    }
+    // /motor_angle has no header, so its arrival time stands in for when the view started moving
+    camera_angle_history_.push_back({this->now(), angle_rad, camera_angle_history_.empty()});
+    while (camera_angle_history_.size() > CAMERA_ANGLE_HISTORY_SIZE)
+        camera_angle_history_.pop_front();
+
+    RCLCPP_INFO(this->get_logger(), "Camera view angle: %.1f deg", msg->data);
+}
+
+SmootherNode::CameraAngleLookup SmootherNode::lookup_camera_angle(const rclcpp::Time& target_time) const
+{
+    CameraAngleLookup result;
+    if (camera_angle_history_.empty())
+        return result;
+
+    // Last change at or before the image. An image older than the first reading uses the first reading.
+    auto it = camera_angle_history_.rbegin();
+    while (it != camera_angle_history_.rend() && it->time > target_time)
+        ++it;
+    const CameraAngleChange& change = (it == camera_angle_history_.rend()) ? camera_angle_history_.front() : *it;
+
+    result.angle_rad = change.angle_rad;
+    result.settling = !change.is_first && (target_time - change.time).seconds() < camera_settle_seconds_;
+    return result;
 }
 
 std::optional<JointState::ConstSharedPtr> lookup_joint_state(
@@ -262,6 +281,14 @@ std::optional<RawSample> SmootherNode::create_raw_sample(const Image::SharedPtr&
     // Adjust image timestamp to account for camera lag
     rclcpp::Time stamp = rclcpp::Time(msg->header.stamp) - rclcpp::Duration::from_seconds(camera_lag_seconds_);
 
+    // View angle for this image. While the view is still moving after a change, the angle is uncertain and the
+    // image may be blurred, so its keypoints are skipped (tracker and calibrator) until it settles.
+    const CameraAngleLookup camera = lookup_camera_angle(stamp);
+    if (!camera.angle_rad) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "No view angle on %s yet; using the solver's nominal CAMERA_ANGLE.", camera_angle_topic_.c_str());
+    }
+
     // Use adjusted stamp to lookup joint states
     std::optional<JointState::ConstSharedPtr> left_joint_state = lookup_left_joint_state(stamp);
     std::optional<JointState::ConstSharedPtr> right_joint_state = lookup_right_joint_state(stamp);
@@ -312,7 +339,8 @@ std::optional<RawSample> SmootherNode::create_raw_sample(const Image::SharedPtr&
             (*right_joint_state)->position[3]),
         .left_tip_force_prior = force_prior,
         .right_tip_force_prior = force_prior,
-        .ignore_keypoints = ignore_keypoints_mode_
+        .ignore_keypoints = ignore_keypoints_mode_ || camera.settling,
+        .camera_angle = camera.angle_rad
     };
 
     return sample;
@@ -361,6 +389,12 @@ void SmootherNode::set_camera_lag_seconds(double value)
     RCLCPP_INFO(this->get_logger(), "camera_lag_seconds: %.3f s", value);
 }
 
+void SmootherNode::set_camera_settle_seconds(double value)
+{
+    camera_settle_seconds_ = value;
+    RCLCPP_INFO(this->get_logger(), "camera_settle_seconds: %.2f s", value);
+}
+
 void SmootherNode::set_left_tip_offset(const gtsam::Vector3& offset)
 {
     left_tip_offset_ = offset;
@@ -385,6 +419,7 @@ void SmootherNode::load_ros_params()
     set_ignore_keypoints_mode(this->declare_parameter<bool>("ignore_keypoints_mode", DEFAULT_IGNORE_KEYPOINTS_MODE));
     set_track_forces_mode    (this->declare_parameter<bool>("track_forces_mode",     DEFAULT_TRACK_FORCES_MODE));
     set_camera_lag_seconds   (this->declare_parameter<double>("camera_lag_seconds",  DEFAULT_CAMERA_LAG_SECONDS));
+    set_camera_settle_seconds(this->declare_parameter<double>("camera_settle_seconds", DEFAULT_CAMERA_SETTLE_SECONDS));
 
     set_left_tip_offset({
         this->declare_parameter<double>("left.tip_offset.x", 0.0),
@@ -420,6 +455,9 @@ rcl_interfaces::msg::SetParametersResult SmootherNode::on_parameter_change(
         }
         else if (name == "camera_lag_seconds") {
             set_camera_lag_seconds(param.as_double());
+        }
+        else if (name == "camera_settle_seconds") {
+            set_camera_settle_seconds(param.as_double());
         }
         else if (name == "left.tip_offset.x") {
             new_left_offset.x() = param.as_double(); left_offset_changed = true;
@@ -477,17 +515,22 @@ static void log_publish_stats(
     avg_tracking_ms  /= window.size();
     double rate_hz = window.size() / PERF_WINDOW_SECONDS;
     std::string calibration_status = solved.calibration_stopped ? "stopped" : "running";
+    const auto& angle = solved.keypoint.raw.camera_angle;
+    std::string view = angle ? std::to_string(static_cast<int>(std::lround(*angle * 180.0 / M_PI))) + " deg" : "nominal";
+    if (solved.keypoint.raw.ignore_keypoints) view += " (keypoints off)";
 
     RCLCPP_INFO(logger,
         "publish rate:  %.1f Hz | "
         "keypoints: L:%zu, R:%zu, %.1f ms | "
         "tracking: %.1f ms | "
+        "view: %s | "
         "calibration: %s",
         rate_hz, 
         solved.keypoint.keypoints.left_keypoints.size(),
         solved.keypoint.keypoints.right_keypoints.size(),
         avg_inference_ms, 
         avg_tracking_ms,
+        view.c_str(),
         calibration_status.c_str());
 }
 

@@ -8,10 +8,17 @@ tips can end up out of view. This script instead sweeps each arm through joint r
 checked by eye keep the tip visible. It needs no geometry at all: the calibrator only needs pairs of
 joint values and detected tips, spread over the workspace.
 
-Per arm: wait for /mover_uterus/continue (or task "calibrate"), move slowly from the current pose to
-the first waypoint, sweep a serpentine grid over (outer translation, outer rotation, inner extension)
-while rolling the inner tube, then return slowly to home. The other arm is held where it is.
-After both arms it sends /smoother_uterus/stop_calibration to lock the calibration in.
+The sweep runs at each EndoCAMeleon view angle in VIEW_ANGLES_DEG, so the calibrator sees the tips
+from several views and can solve the camera mount (tilt, roll) as well as the arm bases. For each view:
+set the angle on /motor_angle with both arms at home, wait for it to settle, then per arm: wait for
+/mover_uterus/continue (or task "calibrate"), move slowly to the first waypoint, sweep a serpentine grid
+over (outer translation, outer rotation, inner extension) while rolling the inner tube, and return
+slowly to home. The other arm is held where it is. After the last view it puts the view back where it
+was (if it saw a /motor_angle reading) and sends /smoother_uterus/stop_calibration; the smoother then
+runs one final solve with every sample and locks it in.
+
+Expect about 3x the single-view run time, and a smoother calibration solve that takes longer as samples
+pile up. Lower N_OUTER_TRANS / N_OUTER_ROT / N_INNER if that gets too slow.
 
 Commands go straight to motor_node on /robot/state/current_state. Don't run servo goals, the IK
 node or keyboard control at the same time. Try it with sim_motor_node.py first.
@@ -25,28 +32,62 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Empty, Float32MultiArray, String
+from std_msgs.msg import Empty, Float32, Float32MultiArray, String
+
+# EndoCAMeleon view angles to calibrate at (deg, published on VIEW_ANGLE_TOPIC, 18-88 for safety)
+VIEW_ANGLES_DEG = (18.0,)
+VIEW_ANGLE_TOPIC = '/motor_angle'     # std_msgs/Float32, degrees
+VIEW_SETTLE_S = 3.0                   # arms held at home this long after a view change
 
 # ---------------------------------------------------------------------------------------------------
-# Joint ranges where the tip stays in view. Find them by jogging one arm and watching the image, e.g.
+# Joint ranges where the tip stays in view, PER VIEW ANGLE: what's visible changes with the view. Find
+# them by setting the view and jogging one arm while watching the image, e.g.
+#   ros2 topic pub -1 /motor_angle std_msgs/msg/Float32 "{data: 53.0}"
 #   ros2 topic pub -1 /robot/state/current_state std_msgs/msg/Float32MultiArray \
 #     "{data: [0.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.03, 0.015]}"      # left: inner 30 mm, outer 15 mm
 # Per-joint layout of each arm: [inner_rot, outer_rot, inner_trans, outer_trans] (rad, m)
+# The 53 and 88 deg entries start as copies of the 18 deg ranges: check them before running.
 # ---------------------------------------------------------------------------------------------------
 RANGES = {
-    'left': {
-        'outer_trans': (0.010, 0.025),          # m; below the minimum the tube hasn't curved down into view
-        'inner_extra': (0.005, 0.025),          # m the inner tube sticks out past the outer
-        'outer_rot': (np.radians(-30), np.radians(30)),  # 0 bends the tubes down toward the camera
-    },
-    'right': {
-        'outer_trans': (0.010, 0.03),
-        'inner_extra': (0.005, 0.03),
-        'outer_rot': (np.radians(-10), np.radians(50)),
-    },
+    18.0: {
+        'left': {
+            'outer_trans': (0.015, 0.025),      # m; below the minimum the tube hasn't curved down into view
+            'inner_extra': (0.01, 0.030),      # m the inner tube sticks out past the outer
+            'outer_rot': (np.radians(-20), np.radians(10)),  # 0 bends the tubes down toward the camera
+        },
+        'right': {
+            'outer_trans': (0.015, 0.025),
+            'inner_extra': (0.01, 0.03),
+            'outer_rot': (np.radians(5), np.radians(30)),
+        },
+    }
+    # 30.0: {
+    #     'left': {
+    #         'outer_trans': (0.0225, 0.032),
+    #         'inner_extra': (0.001, 0.025),
+    #         'outer_rot': (np.radians(-30), np.radians(10)),
+    #     },
+    #     'right': {
+    #         'outer_trans': (0.0225, 0.032),
+    #         'inner_extra': (0.001, 0.025),
+    #         'outer_rot': (np.radians(5), np.radians(50)),
+    #     },
+    # },
+    # 55.0: {
+    #     'left': {
+    #         'outer_trans': (0.025, 0.035),
+    #         'inner_extra': (0.015, 0.03),
+    #         'outer_rot': (np.radians(-30), np.radians(10)),
+    #     },
+    #     'right': {
+    #         'outer_trans': (0.025, 0.035),
+    #         'inner_extra': (0.015, 0.03),
+    #         'outer_rot': (np.radians(5), np.radians(50)),
+    #     },
+    # },
 }
 N_OUTER_TRANS = 5      # levels of outer translation
-N_OUTER_ROT = 5        # levels of outer rotation (swept back and forth)
+N_OUTER_ROT = 3        # levels of outer rotation (swept back and forth)
 N_INNER = 3            # levels of inner extension
 ROLL_PATTERN = [0.0, np.pi, 0.0, -np.pi]   # inner tube roll, cycled per waypoint (helps convergence)
 
@@ -92,6 +133,12 @@ class JointCalibrationRunner(Node):
         super().__init__('joint_calibration_runner')
         self.cmd_pub = self.create_publisher(Float32MultiArray, ROBOT_CMD_TOPIC, 1)
         self.stop_calibration_pub = self.create_publisher(Empty, '/smoother_uterus/stop_calibration', 10)
+        self.view_pub = self.create_publisher(Float32, VIEW_ANGLE_TOPIC, 10)
+
+        # Last view angle anyone published, so it can be restored at the end
+        self.view_angle = None
+        self.create_subscription(Float32, VIEW_ANGLE_TOPIC,
+                                 lambda msg: setattr(self, 'view_angle', float(msg.data)), 10)
 
         self.last_cmd = None
         self.create_subscription(Float32MultiArray, ROBOT_CMD_TOPIC, self.cmd_callback, 10)
@@ -154,9 +201,22 @@ class JointCalibrationRunner(Node):
             rclpy.spin_once(self, timeout_sec=0.0)
             time.sleep(1.0 / RATE_HZ)
 
-    def wait_for_continue(self, arm):
+    def set_view(self, angle_deg):
+        """Command a view angle with both arms at home, then hold them still while the view settles."""
+        deadline = time.time() + 5.0
+        while rclpy.ok() and self.view_pub.get_subscription_count() == 0 and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.view_pub.get_subscription_count() == 0:
+            self.get_logger().warn(f'Nothing subscribes to {VIEW_ANGLE_TOPIC}; the view may not move')
+
+        self.get_logger().info(f'View angle -> {angle_deg:.0f} deg, settling for {VIEW_SETTLE_S:.0f} s')
+        self.view_pub.publish(Float32(data=float(angle_deg)))
+        self.dwell(self.current_command(), VIEW_SETTLE_S)
+
+    def wait_for_continue(self, arm, angle_deg):
         self.get_logger().info(
-            f'{arm} arm next: publish /mover_uterus/continue or type "calibrate" in task_publisher')
+            f'{arm} arm at view {angle_deg:.0f} deg next: publish /mover_uterus/continue or type "calibrate" '
+            f'in task_publisher')
         self.continue_received = False
         sub = self.create_subscription(Empty, '/mover_uterus/continue',
                                        lambda _: setattr(self, 'continue_received', True), 10)
@@ -169,16 +229,16 @@ class JointCalibrationRunner(Node):
         self.destroy_subscription(sub)
         self.destroy_subscription(task_sub)
 
-    def run_arm(self, arm):
-        self.wait_for_continue(arm)
+    def run_arm(self, arm, angle_deg):
+        self.wait_for_continue(arm, angle_deg)
         q = self.current_command()
-        waypoints = arm_waypoints(RANGES[arm])
-        self.get_logger().info(f'{arm} arm: {len(waypoints)} waypoints')
+        waypoints = arm_waypoints(RANGES[angle_deg][arm])
+        self.get_logger().info(f'{arm} arm at view {angle_deg:.0f} deg: {len(waypoints)} waypoints')
         for i, wp in enumerate(waypoints):
             ir, orr, it, ot = clip_arm(wp)
             self.get_logger().info(
-                f'{arm} {i + 1}/{len(waypoints)}: outer {ot * 1000:.1f} mm, inner {it * 1000:.1f} mm, '
-                f'outer rot {np.degrees(orr):.0f} deg, roll {np.degrees(ir):.0f} deg')
+                f'{arm} @ {angle_deg:.0f} deg {i + 1}/{len(waypoints)}: outer {ot * 1000:.1f} mm, '
+                f'inner {it * 1000:.1f} mm, outer rot {np.degrees(orr):.0f} deg, roll {np.degrees(ir):.0f} deg')
             q = self.move_arm(q, arm, wp)
             self.dwell(q, DWELL_S)
 
@@ -190,9 +250,21 @@ class JointCalibrationRunner(Node):
         self.get_logger().info(f'{arm} arm done, at home')
 
     def run(self):
-        self.run_arm('left')
-        self.run_arm('right')
-        self.get_logger().info('Sending /smoother_uterus/stop_calibration to lock in the calibration')
+        # Note the current view (if /motor_angle has been published) to put it back afterwards
+        end = time.time() + 1.0
+        while rclpy.ok() and time.time() < end:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        start_view = self.view_angle
+
+        for angle_deg in VIEW_ANGLES_DEG:
+            self.set_view(angle_deg)
+            self.run_arm('left', angle_deg)
+            self.run_arm('right', angle_deg)
+
+        if start_view is not None:
+            self.set_view(start_view)
+        self.get_logger().info('Sending /smoother_uterus/stop_calibration: the smoother runs a final solve '
+                               'with every sample, then locks it in (watch its log)')
         self.stop_calibration_pub.publish(Empty())
         self.dwell(self.current_command(), 1.0)
 

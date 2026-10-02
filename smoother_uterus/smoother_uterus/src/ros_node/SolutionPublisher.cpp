@@ -21,7 +21,13 @@ using std_msgs::msg::Float64MultiArray;
 
 namespace {
     const std::string TOPIC_NS = "smoother_uterus";
-    const std::string FRAME_ID = TOPIC_NS + "/camera";
+
+    // Topics are published in the camera frame of their image (FRAME_ID), as before the view angle could
+    // change. TF and rviz markers use the endoscope tip frame (ENDO_FRAME_ID), the solver's world frame, which
+    // stays put when the view swings. TF tree: endo -> camera (moves with the view angle), endo -> <side>/base,
+    // endo -> <side>/tip.
+    const std::string FRAME_ID      = TOPIC_NS + "/camera";
+    const std::string ENDO_FRAME_ID = TOPIC_NS + "/endo";
 
     const std::array<std::string, 2> arm_labels = {"left", "right"};
     const std::array<std::string, 2> tube_labels = {"outer", "inner"};
@@ -34,6 +40,10 @@ namespace {
     constexpr double FORCE_ARROW_SHAFT_DIAMETER = 0.00025;
     constexpr double FORCE_ARROW_HEAD_DIAMETER  = 0.0005;
     constexpr double FORCE_ARROW_HEAD_LENGTH    = 0.0005;
+
+    // Camera field-of-view marker: pyramid from the camera out to this depth (m)
+    constexpr double FOV_MARKER_DEPTH      = 0.04;
+    constexpr double FOV_MARKER_LINE_WIDTH = 0.0002;
 
     // Minimum force magnitude to display markers (suppresses noise visualization)
     constexpr double FORCE_DISPLAY_THRESHOLD = 1e-3;
@@ -241,6 +251,35 @@ cv::Mat make_overlay_image(const SolvedPipelineSample& solved)
     return image;
 }
 
+// Endoscope-frame quantities -> this image's camera frame. GTSAM pose covariances are in body coordinates,
+// which a change of reference frame leaves unchanged; vectors and Jacobians rotate.
+Pose3Gaussian to_camera(const Pose3Gaussian& pose, const Pose3& camera_from_endo)
+{
+    return {(camera_from_endo * Pose3(pose.mean)).matrix(), pose.cov};
+}
+
+std::array<Pose3Gaussian, NODES_PER_TUBE> to_camera(
+    const std::array<Pose3Gaussian, NODES_PER_TUBE>& poses, const Pose3& camera_from_endo)
+{
+    std::array<Pose3Gaussian, NODES_PER_TUBE> out;
+    for (size_t i = 0; i < poses.size(); ++i)
+        out[i] = to_camera(poses[i], camera_from_endo);
+    return out;
+}
+
+Vector3Gaussian rotate_to_camera(const Vector3Gaussian& v, const Matrix3& R)
+{
+    return {R * v.mean, R * v.cov * R.transpose()};
+}
+
+Matrix64 jacobian_to_camera(const Matrix64& J, const Matrix3& R)
+{
+    Matrix64 out;
+    out.topRows<3>()    = R * J.topRows<3>();     // angular velocity per joint
+    out.bottomRows<3>() = R * J.bottomRows<3>();  // tip linear velocity per joint
+    return out;
+}
+
 Pose gtsam_pose_to_msg(const Matrix4& pose)
 {
     Pose msg;
@@ -336,13 +375,14 @@ void send_pose_as_tf(
     const Matrix4& pose,
     tf2_ros::TransformBroadcaster* broadcaster,
     const std::string& child_frame_id,
-    const rclcpp::Time& stamp)
+    const rclcpp::Time& stamp,
+    const std::string& parent_frame_id)
 {
     geometry_msgs::msg::Pose msg = gtsam_pose_to_msg(pose);
 
     TransformStamped t;
     t.header.stamp = stamp;
-    t.header.frame_id = FRAME_ID;
+    t.header.frame_id = parent_frame_id;
     t.child_frame_id = child_frame_id;
     t.transform.translation.x = msg.position.x;
     t.transform.translation.y = msg.position.y;
@@ -382,7 +422,8 @@ void publish_tube_marker_array(
     const std::string& ns,
     ArmTube tube,
     const rclcpp::Publisher<MarkerArray>::SharedPtr& pub,
-    const rclcpp::Time& stamp)
+    const rclcpp::Time& stamp,
+    const std::string& frame_id)
 {
     visualization_msgs::msg::MarkerArray marker_array;
     marker_array.markers.reserve(NODES_PER_TUBE - 1);
@@ -401,7 +442,7 @@ void publish_tube_marker_array(
             : Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), dir.normalized());
 
         visualization_msgs::msg::Marker marker;
-        marker.header.frame_id = FRAME_ID;
+        marker.header.frame_id = frame_id;
         marker.header.stamp = stamp;
         marker.ns = ns + "_tube";
         marker.id = marker_id++;
@@ -485,7 +526,8 @@ Marker get_uncertainty_ellipsoid_marker(const Vector3& p, const Matrix3& p_cov, 
 void publish_tip_position_uncertainty_marker(
     const Pose3Gaussian& tip_pose,
     const rclcpp::Publisher<Marker>::SharedPtr& pub,
-    const rclcpp::Time& stamp)
+    const rclcpp::Time& stamp,
+    const std::string& frame_id)
 {
     // Unpack pose and covariance to eigen matrices
     Point3 p = tip_pose.mean.block<3,1>(0,3);
@@ -497,7 +539,7 @@ void publish_tip_position_uncertainty_marker(
 
     Marker marker = get_uncertainty_ellipsoid_marker(p, p_cov);
 
-    marker.header.frame_id = FRAME_ID;
+    marker.header.frame_id = frame_id;
     marker.header.stamp = stamp;
     marker.ns   = "tip_ellipsoid";
     marker.id   = 0;
@@ -512,7 +554,8 @@ void publish_tip_force_markers(
     const SingleArmMarginals& arm,
     const rclcpp::Publisher<Marker>::SharedPtr& arrow_pub,
     const rclcpp::Publisher<Marker>::SharedPtr& uncertainty_pub,
-    const rclcpp::Time& stamp)
+    const rclcpp::Time& stamp,
+    const std::string& frame_id)
 {
     Vector3 f_mean = arm.tip_force.mean;
     Matrix3 f_cov = arm.tip_force.cov;
@@ -527,7 +570,7 @@ void publish_tip_force_markers(
     if (f_mean.norm() < FORCE_DISPLAY_THRESHOLD) {
         // Delete any previously published markers so they don't stick in RViz
         Marker del;
-        del.header.frame_id = FRAME_ID;
+        del.header.frame_id = frame_id;
         del.header.stamp = stamp;
         del.action = Marker::DELETE;
         del.ns = "tip_force_arrow"; del.id = 0;
@@ -539,7 +582,7 @@ void publish_tip_force_markers(
 
     // Arrow marker for mean force
     Marker arrow_marker;
-    arrow_marker.header.frame_id = FRAME_ID;
+    arrow_marker.header.frame_id = frame_id;
     arrow_marker.header.stamp = stamp;
     arrow_marker.ns = "tip_force_arrow";
     arrow_marker.id = 0;
@@ -566,7 +609,7 @@ void publish_tip_force_markers(
     // Ellipsoid marker for force uncertainty
     Marker uncertainty_marker = get_uncertainty_ellipsoid_marker(p + f_scaled, f_cov, force_vis_scale);
 
-    uncertainty_marker.header.frame_id = FRAME_ID;
+    uncertainty_marker.header.frame_id = frame_id;
     uncertainty_marker.header.stamp = stamp;
     uncertainty_marker.ns = "tip_force_uncertainty";
     uncertainty_marker.id = 0;
@@ -609,7 +652,7 @@ SolutionPublisher::SolutionPublisher(rclcpp::Node& node) : node_(node) {
         jac_position_joints_pubs_[static_cast<int>(side)] = node_.create_publisher<Float64MultiArray>(
             TOPIC_NS + "/" + arm_label + "/jac_tip_pose", 10);
 
-        // TF broadcasters
+        // TF broadcasters (parent: endoscope frame)
         base_tf_broadcasters_[static_cast<int>(side)] = std::make_shared<tf2_ros::TransformBroadcaster>(node_);
         tip_tf_broadcasters_[static_cast<int>(side)] = std::make_shared<tf2_ros::TransformBroadcaster>(node_);
 
@@ -631,6 +674,17 @@ SolutionPublisher::SolutionPublisher(rclcpp::Node& node) : node_(node) {
     // Image overlay pub
     overlay_image_pub_ = node_.create_publisher<Image>(
         TOPIC_NS + "/overlay_image", 10);
+
+    // Endoscope -> camera TF, which changes with the view angle
+    camera_tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node_);
+
+    // Camera field of view (rviz)
+    camera_fov_pub_ = node_.create_publisher<MarkerArray>(TOPIC_NS + "/camera_fov", 10);
+}
+
+void SolutionPublisher::set_camera_intrinsics(const gtsam::Cal3_S2& camera_intrinsics)
+{
+    camera_intrinsics_ = camera_intrinsics;
 }
 
 void SolutionPublisher::publish_single_arm(
@@ -644,29 +698,40 @@ void SolutionPublisher::publish_single_arm(
     const auto& stamp = solved.keypoint.raw.stamp;
     const int s = static_cast<int>(side);
     const auto& side_str = arm_labels[s];
-
-    publish_pose_array(arm.outer_tube_poses, pose_array_pubs_[s][static_cast<int>(ArmTube::OUTER)], stamp);
-    publish_pose_array(arm.inner_tube_poses, pose_array_pubs_[s][static_cast<int>(ArmTube::INNER)], stamp);
-    publish_pixels(arm.tip_uvz, pixels_pubs_[s], stamp);
-
-    // Tip pose to camera
-    publish_pose_with_cov(arm.tip_pose, tip_pose_pubs_[s], stamp);
-    send_pose_as_tf(arm.tip_pose.mean, tip_tf_broadcasters_[s].get(), TOPIC_NS + "/" + side_str + "/tip", stamp);
-    publish_jac_tip_pose(arm.jac_tip_pose, jac_position_joints_pubs_[s], stamp);
-
-    // Tip force to camera
-    publish_force_with_cov(arm.tip_force, tip_force_pubs_[s], stamp);
-
-    // Base pose to camera
     const auto& calib_arm = (side == ArmSide::LEFT) ? solved.solution.calibration.left_arm : solved.solution.calibration.right_arm;
-    publish_pose_with_cov(calib_arm.base_pose, base_pose_pubs_[s], stamp);
-    send_pose_as_tf(calib_arm.base_pose.mean, base_tf_broadcasters_[s].get(), TOPIC_NS + "/" + side_str + "/base", stamp);
 
-    // Visualization markers
-    publish_tube_marker_array(arm.outer_tube_poses, side_str + "_outer", ArmTube::OUTER, tube_marker_pubs_[s][static_cast<int>(ArmTube::OUTER)], stamp);
-    publish_tube_marker_array(arm.inner_tube_poses, side_str + "_inner", ArmTube::INNER, tube_marker_pubs_[s][static_cast<int>(ArmTube::INNER)], stamp);
-    publish_tip_position_uncertainty_marker(arm.tip_pose, tip_position_uncertainty_marker_pubs_[s], stamp);
-    publish_tip_force_markers(arm, tip_force_arrow_marker_pubs_[s], tip_force_uncertainty_marker_pubs_[s], stamp);
+    // The solver works in the endoscope frame; this image's camera frame depends on its view angle
+    const Pose3 camera_from_endo(arm.camera_from_endo);
+    const Matrix3 R_camera_from_endo = camera_from_endo.rotation().matrix();
+
+    // Topics, in this image's camera frame (what the visual servo and other consumers expect)
+    publish_pose_array(to_camera(arm.outer_tube_poses, camera_from_endo), pose_array_pubs_[s][static_cast<int>(ArmTube::OUTER)], stamp);
+    publish_pose_array(to_camera(arm.inner_tube_poses, camera_from_endo), pose_array_pubs_[s][static_cast<int>(ArmTube::INNER)], stamp);
+    publish_pixels(arm.tip_uvz, pixels_pubs_[s], stamp);
+    publish_pose_with_cov(to_camera(arm.tip_pose, camera_from_endo), tip_pose_pubs_[s], stamp);
+    publish_jac_tip_pose(jacobian_to_camera(arm.jac_tip_pose, R_camera_from_endo), jac_position_joints_pubs_[s], stamp);
+    publish_force_with_cov(rotate_to_camera(arm.tip_force, R_camera_from_endo), tip_force_pubs_[s], stamp);
+    publish_pose_with_cov(to_camera(calib_arm.base_pose, camera_from_endo), base_pose_pubs_[s], stamp);
+
+    // TF, in the endoscope frame
+    send_pose_as_tf(arm.tip_pose.mean, tip_tf_broadcasters_[s].get(), TOPIC_NS + "/" + side_str + "/tip", stamp, ENDO_FRAME_ID);
+    send_pose_as_tf(calib_arm.base_pose.mean, base_tf_broadcasters_[s].get(), TOPIC_NS + "/" + side_str + "/base", stamp, ENDO_FRAME_ID);
+
+    // Visualization markers, in the endoscope frame (they stay put when the view swings)
+    publish_tube_marker_array(arm.outer_tube_poses, side_str + "_outer", ArmTube::OUTER, tube_marker_pubs_[s][static_cast<int>(ArmTube::OUTER)], stamp, ENDO_FRAME_ID);
+    publish_tube_marker_array(arm.inner_tube_poses, side_str + "_inner", ArmTube::INNER, tube_marker_pubs_[s][static_cast<int>(ArmTube::INNER)], stamp, ENDO_FRAME_ID);
+    publish_tip_position_uncertainty_marker(arm.tip_pose, tip_position_uncertainty_marker_pubs_[s], stamp, ENDO_FRAME_ID);
+    publish_tip_force_markers(arm, tip_force_arrow_marker_pubs_[s], tip_force_uncertainty_marker_pubs_[s], stamp, ENDO_FRAME_ID);
+}
+
+void SolutionPublisher::publish_camera_tf(const SolvedPipelineSample& solved) const
+{
+    // Both arms' samples for an image share its camera
+    const auto& arm_vec = solved.solution.left_arm.empty() ? solved.solution.right_arm : solved.solution.left_arm;
+    if (arm_vec.empty()) return;
+
+    const Pose3 camera_in_endo = Pose3(arm_vec.back().camera_from_endo).inverse();
+    send_pose_as_tf(camera_in_endo.matrix(), camera_tf_broadcaster_.get(), FRAME_ID, solved.keypoint.raw.stamp, ENDO_FRAME_ID);
 }
 
 void SolutionPublisher::publish_overlay_image(const SolvedPipelineSample& solved) const
@@ -682,8 +747,62 @@ void SolutionPublisher::publish_overlay_image(const SolvedPipelineSample& solved
     overlay_image_pub_->publish(*overlay_image_msg);
 }
 
+void SolutionPublisher::publish_camera_fov(const SolvedPipelineSample& solved) const
+{
+    if (!camera_intrinsics_)
+        return;
+    const auto& K = *camera_intrinsics_;
+    const double width  = solved.keypoint.raw.image.cols;
+    const double height = solved.keypoint.raw.image.rows;
+    if (width <= 0 || height <= 0)
+        return;
+
+    // Image corners back-projected to FOV_MARKER_DEPTH, in the camera frame (x right, y down, z forward)
+    auto corner = [&](double u, double v) {
+        geometry_msgs::msg::Point p;
+        p.x = (u - K.px()) / K.fx() * FOV_MARKER_DEPTH;
+        p.y = (v - K.py()) / K.fy() * FOV_MARKER_DEPTH;
+        p.z = FOV_MARKER_DEPTH;
+        return p;
+    };
+    const geometry_msgs::msg::Point apex;  // camera centre
+    const std::array<geometry_msgs::msg::Point, 4> corners = {
+        corner(0, 0), corner(width, 0), corner(width, height), corner(0, height)};
+
+    Marker edges;
+    edges.header.frame_id = FRAME_ID;
+    edges.header.stamp = solved.keypoint.raw.stamp;
+    edges.ns = "camera_fov_edges";
+    edges.id = 0;
+    edges.type = Marker::LINE_LIST;
+    edges.action = Marker::ADD;
+    edges.pose.orientation.w = 1.0;
+    edges.scale.x = FOV_MARKER_LINE_WIDTH;
+    edges.color.r = 0.2f; edges.color.g = 0.6f; edges.color.b = 1.0f; edges.color.a = 0.9f;
+    edges.lifetime = rclcpp::Duration::from_seconds(0.5);
+
+    Marker faces = edges;
+    faces.ns = "camera_fov_faces";
+    faces.type = Marker::TRIANGLE_LIST;
+    faces.scale.x = faces.scale.y = faces.scale.z = 1.0;
+    faces.color.a = 0.08f;
+
+    for (size_t i = 0; i < corners.size(); ++i) {
+        const auto& a = corners[i];
+        const auto& b = corners[(i + 1) % corners.size()];
+        edges.points.insert(edges.points.end(), {apex, a, a, b});   // edge from the camera, then the far rim
+        faces.points.insert(faces.points.end(), {apex, a, b});      // one side of the pyramid
+    }
+
+    MarkerArray markers;
+    markers.markers = {edges, faces};
+    camera_fov_pub_->publish(markers);
+}
+
 void SolutionPublisher::publish(const SolvedPipelineSample& solved) const
 {
+    publish_camera_tf(solved);
+    publish_camera_fov(solved);
     publish_single_arm(solved, ArmSide::LEFT);
     publish_single_arm(solved, ArmSide::RIGHT);
     publish_overlay_image(solved);

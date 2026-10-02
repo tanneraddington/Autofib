@@ -1,6 +1,7 @@
 #include "SmootherPipeline.h"
 #include "solver/SmootherSolver.h"
 
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <chrono>
@@ -36,13 +37,13 @@ static void push_sample_with_keypoints_throttle(
 static SingleArmSample make_left_arm_sample(const KeypointPipelineSample& s)
 {
     return {s.raw.stamp.seconds(), s.raw.left_joint_values,
-            s.keypoints.left_keypoints, s.raw.left_tip_force_prior, std::nullopt};
+            s.keypoints.left_keypoints, s.raw.left_tip_force_prior, std::nullopt, s.raw.camera_angle};
 }
 
 static SingleArmSample make_right_arm_sample(const KeypointPipelineSample& s)
 {
     return {s.raw.stamp.seconds(), s.raw.right_joint_values,
-            s.keypoints.right_keypoints, s.raw.right_tip_force_prior, std::nullopt};
+            s.keypoints.right_keypoints, s.raw.right_tip_force_prior, std::nullopt, s.raw.camera_angle};
 }
 
 static std::optional<SmootherSolution> try_solver_solve(
@@ -99,7 +100,9 @@ SmootherPipeline::~SmootherPipeline()
 
 void SmootherPipeline::stop_calibration()
 {
-    stop_calibration_ = true;
+    // The calibrator runs one final solve with every sample collected, posts it, then locks in. Locking in
+    // immediately would keep whatever solve last finished, which can miss the end of a long calibration run.
+    stop_requested_ = true;
 }
 
 void SmootherPipeline::push_raw_sample(const RawSample& sample)
@@ -241,8 +244,12 @@ void SmootherPipeline::tracking_loop()
         // Copy original sample, since we want to use original for publishing but may modify it for tracker solving
         auto keypoint_sample = *original_keypoint_sample;
 
+        // Read once: if set, the final calibration was already posted, so the consume below picks it up and
+        // the solution published as "locked in" (and saved) uses it.
+        const bool calibration_stopped = stop_calibration_;
+
         // If we are still calibrating, disregard keypoints to avoid ill-posed solutions with bad initial calibration
-        if (!stop_calibration_) {
+        if (!calibration_stopped) {
             keypoint_sample.keypoints.left_keypoints.clear();
             keypoint_sample.keypoints.right_keypoints.clear();
         }
@@ -268,7 +275,7 @@ void SmootherPipeline::tracking_loop()
         // Only publish if we got a solution, otherwise just wait for the next sample and try again
         // Use origianl keypoint sample for publishing so we can see the keypoints even if not actually used 
         if (solution)
-            post_tracker_solution_to_publisher({*original_keypoint_sample, *solution, stop_calibration_});
+            post_tracker_solution_to_publisher({*original_keypoint_sample, *solution, calibration_stopped});
     }
 }
 
@@ -302,17 +309,21 @@ void SmootherPipeline::solve_calibration()
 
     const auto& lh = solution->calibration.left_arm;
     const auto& rh = solution->calibration.right_arm;
+    const auto& cam = solution->calibration.camera_mount_diff;
 
     RCLCPP_INFO(logger_,
         "CALIBRATOR: new calibration computed, see normed differences from nominal below\n"
         "  left:  valid: %s, outer_curv=%.1f  inner_curv=%.2f  rot=%.1fdeg\n"
-        "  right: valid: %s, outer_curv=%.1f  inner_curv=%.2f  rot=%.1fdeg",
+        "  right: valid: %s, outer_curv=%.1f  inner_curv=%.2f  rot=%.1fdeg\n"
+        "  camera mount: tilt=%.1fdeg  roll=%.1fdeg  pivot offset=%.1fmm",
         lh.is_valid ? "OK  " : "FAIL",
         lh.outer_curvature_diff.norm(), lh.inner_curvature_diff.norm(),
         lh.base_pose_diff.head<3>().norm() * 180.0 / M_PI,
         rh.is_valid ? "OK  " : "FAIL",
         rh.outer_curvature_diff.norm(), rh.inner_curvature_diff.norm(),
-        rh.base_pose_diff.head<3>().norm() * 180.0 / M_PI);
+        rh.base_pose_diff.head<3>().norm() * 180.0 / M_PI,
+        cam.head<2>().norm() * 180.0 / M_PI, std::abs(cam[2]) * 180.0 / M_PI,
+        cam.tail<3>().norm() * 1000.0);
 
     if (!solution->calibration.is_valid) {
         RCLCPP_WARN(logger_, "CALIBRATOR calibration rejected, solution too far from nominal, see above");
@@ -328,6 +339,20 @@ void SmootherPipeline::calibration_loop()
     // This loop doesnt have to be fast or interruptible since it runs in the background
     while (!stop_threads_ && !stop_calibration_) {
         std::this_thread::sleep_for(CALIBRATION_SLEEP_DURATION);
+
+        if (stop_requested_) {
+            size_t num_samples;
+            {
+                std::lock_guard lock(calibrator_dataset_mtx_);
+                num_samples = calibrator_left_dataset_.size() + calibrator_right_dataset_.size();
+            }
+            RCLCPP_INFO(logger_, "CALIBRATOR: stop requested, final solve with all %zu samples before locking in...", num_samples);
+            solve_calibration();
+            stop_calibration_ = true;  // after the final calibration is posted to the tracker
+            RCLCPP_INFO(logger_, "CALIBRATOR: calibration locked in.");
+            break;
+        }
+
         solve_calibration();
     }
 }

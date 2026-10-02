@@ -24,6 +24,7 @@ struct RawSample {
     Vector3Gaussian left_tip_force_prior;
     Vector3Gaussian right_tip_force_prior;
     bool ignore_keypoints;
+    std::optional<double> camera_angle;  // view angle (rad) for this image; nullopt = solver's nominal
 };
 
 struct KeypointPipelineSample {
@@ -77,7 +78,8 @@ private:
     void consume_tip_offsets(SmootherSolver& solver);
 
     std::atomic<bool> stop_threads_{false};
-    std::atomic<bool> stop_calibration_{false};
+    std::atomic<bool> stop_calibration_{false};   // calibration locked in: tracker uses keypoints, calibrator stopped
+    std::atomic<bool> stop_requested_{false};     // /stop_calibration received: one final solve, then lock in
 
     rclcpp::Logger logger_;
     gtsam::Cal3_S2 camera_intrinsics_;

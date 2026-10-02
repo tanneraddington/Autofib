@@ -3,6 +3,7 @@
 #include <deque>
 
 #include <gtsam/geometry/Cal3_S2.h>
+#include <gtsam/geometry/Pose3.h>
 #include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Marginals.h>
@@ -43,6 +44,7 @@ private:
     void extract_solution(SmootherSolution& solution);
 
     const std::deque<SingleArmSample>& samples_for(ArmSide side) const;
+    gtsam::Pose3 calibrated_camera_mount() const;  // calibration's mount, or nominal if it has none
 
     // Transient — set at the start of solve(), cleared before returning.
     const std::deque<SingleArmSample>* left_samples_ = nullptr;
@@ -62,9 +64,8 @@ private:
     gtsam::SharedNoiseModel pixel_noise_model_;               // set_pixel_meas_std
     gtsam::SharedNoiseModel small_curvature_noise_model_;     // no setter (SMALL_CURVATURE_STD is a constant)
     gtsam::SharedNoiseModel tip_accel_prior_noise_model_;     // set_tip_accel_prior_std (null until called)
-    gtsam::SharedNoiseModel lens_pose_noise_model_;           // no setter
-    gtsam::SharedNoiseModel lens_to_endo_tip_noise_model_;    // no setter
-    gtsam::SharedNoiseModel endo_tip_to_endo_base_noise_model_; // no setter
+    gtsam::SharedNoiseModel camera_mount_noise_model_;        // no setter
+    gtsam::SharedNoiseModel endo_base_noise_model_;           // no setter
     gtsam::SharedNoiseModel arm_base_to_endo_base_noise_model_; // no setter
     gtsam::SharedNoiseModel outer_curvature_prior_noise_model_; // no setter
     gtsam::SharedNoiseModel inner_curvature_prior_noise_model_; // no setter

@@ -46,24 +46,38 @@ bool project_pose_to_uvz(
 }
 
 TipProjectionFactor::TipProjectionFactor(
+    Key camera_mount_key,
     Key tip_pose_key,
     const std::vector<gtsam::Vector2>& keypoints,
     Cal3_S2 camera_intrinsics,
+    const Pose3& view,
     const SharedNoiseModel& model)
 :
-    NoiseModelFactorN(model, tip_pose_key),
+    NoiseModelFactorN(model, camera_mount_key, tip_pose_key),
     keypoints_(keypoints),
-    camera_intrinsics_(camera_intrinsics) {}
+    camera_intrinsics_(camera_intrinsics),
+    view_(view) {}
 
-Vector TipProjectionFactor::evaluateError(const Pose3& tip_pose, OptionalMatrixType H1) const
+Vector TipProjectionFactor::evaluateError(
+    const Pose3& camera_mount,
+    const Pose3& tip_pose,
+    OptionalMatrixType H1,
+    OptionalMatrixType H2) const
 {
-    Point3 uvz;
-    Matrix36 d_uvz_d_tip_pose;
+    // Endoscope frame -> this image's camera frame: camera_mount * view, then the tip
+    Matrix66 d_mount_view_d_mount;
+    const Pose3 mount_view = camera_mount.compose(view_, d_mount_view_d_mount);
 
-    bool behind_camera = project_pose_to_uvz(tip_pose, camera_intrinsics_, uvz, d_uvz_d_tip_pose);
+    Matrix66 d_cam_d_mount_view, d_cam_d_tip;
+    const Pose3 tip_in_camera = mount_view.compose(tip_pose, d_cam_d_mount_view, d_cam_d_tip);
+
+    Point3 uvz;
+    Matrix36 d_uvz_d_tip_in_camera;
+    bool behind_camera = project_pose_to_uvz(tip_in_camera, camera_intrinsics_, uvz, d_uvz_d_tip_in_camera);
 
     if (keypoints_.empty() || behind_camera) {
         if (H1) *H1 = Matrix26::Zero();
+        if (H2) *H2 = Matrix26::Zero();
         return Vector2::Zero();
     }
 
@@ -78,6 +92,8 @@ Vector TipProjectionFactor::evaluateError(const Pose3& tip_pose, OptionalMatrixT
         }
     }
 
-    if (H1) { *H1 = d_uvz_d_tip_pose.block<2,6>(0, 0); }
+    const Matrix26 d_uv_d_tip_in_camera = d_uvz_d_tip_in_camera.block<2,6>(0, 0);
+    if (H1) { *H1 = d_uv_d_tip_in_camera * d_cam_d_mount_view * d_mount_view_d_mount; }
+    if (H2) { *H2 = d_uv_d_tip_in_camera * d_cam_d_tip; }
     return uvz.head<2>() - closest_keypoint;
 }
